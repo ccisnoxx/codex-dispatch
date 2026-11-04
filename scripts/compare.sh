@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 对比两份快照：compare.sh <基线目录> <当前目录>
+# 对比两份快照：compare.sh <基线目录> <当前目录> <manifest.json>
 # 有任一 FAIL 时退出码为 1。工作树改动（status、worktree.patch、新文件）只展示，由 Claude 判断是否在范围内。
 set -uo pipefail
 export LC_ALL=C
-base=$1 cur=$2
+base=$1 cur=$2 manifest=$3
 fail=0
 bad() { echo "FAIL: $*"; fail=1; }
 ok() { echo "ok:   $*"; }
@@ -13,10 +13,13 @@ for f in head.txt index.patch index-entries.txt refs.txt stash.txt remotes.txt c
   if cmp -s "$base/$f" "$cur/$f"; then ok "$f 未变"; else bad "$f 有变化"; diff "$base/$f" "$cur/$f" | head -20; fi
 done
 
-# index 文件字节变化而条目不变，通常是普通 git status 刷新了 stat 缓存，只警告
-admin_diff=$(diff <(grep -v '/index$' "$base/gitadmin.txt") <(grep -v '/index$' "$cur/gitadmin.txt"))
+# 只放过实际 index 文件的字节变化：条目不变时通常是普通 git status 刷新了 stat 缓存
+idx=" $(printf '%q' "$(jq -r .index_path "$manifest")")"
+not_index() { while IFS= read -r l; do [[ "$l" == *"$idx" ]] || printf '%s\n' "$l"; done < "$1"; }
+only_index() { while IFS= read -r l; do [[ "$l" == *"$idx" ]] && printf '%s\n' "$l"; done < "$1"; return 0; }
+admin_diff=$(diff <(not_index "$base/gitadmin.txt") <(not_index "$cur/gitadmin.txt"))
 if [ -z "$admin_diff" ]; then ok "Git 管理目录未变"; else bad "Git 管理目录有变化"; echo "$admin_diff" | head -30; fi
-if ! cmp -s <(grep '/index$' "$base/gitadmin.txt") <(grep '/index$' "$cur/gitadmin.txt"); then
+if ! cmp -s <(only_index "$base/gitadmin.txt") <(only_index "$cur/gitadmin.txt"); then
   if cmp -s "$base/index-entries.txt" "$cur/index-entries.txt"; then
     echo "WARN: index 文件字节变化但条目一致，可能是 git status 刷新了 stat 缓存"
   fi

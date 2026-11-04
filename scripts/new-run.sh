@@ -22,6 +22,8 @@ g() { safe_git "$root" "$@"; }
 head=$(g rev-parse --verify -q HEAD) || { echo "仓库还没有任何提交，无法建立基线：$root" >&2; exit 2; }
 git_dir=$(real_dir "$(g rev-parse --absolute-git-dir)")
 common_dir=$(real_dir "$(g rev-parse --path-format=absolute --git-common-dir)")
+index_file=$(g rev-parse --path-format=absolute --git-path index)
+index_path="$(real_dir "$(dirname "$index_file")")/$(basename "$index_file")"
 
 # 监视路径：Codex 配置、仓库外的 Git 配置文件（含 include）、全局 ignore/attributes、外部 hooksPath、用户指定路径
 abs() { case "$1" in "~"/*) printf '%s\n' "$HOME/${1:2}" ;; /*) printf '%s\n' "$1" ;; *) printf '%s\n' "$root/$1" ;; esac; }
@@ -48,13 +50,14 @@ jq -n --arg repo "$root" --arg git_dir "$git_dir" --arg common_dir "$common_dir"
       --arg branch "$(g symbolic-ref -q --short HEAD || echo '(detached)')" --arg head "$head" \
       --arg codex_version "$ver" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       --arg sandbox "$EXPECTED_SANDBOX" --arg approval "$EXPECTED_APPROVAL" \
-      --arg watched "$watched" \
-      '{repo: $repo, git_dir: $git_dir, common_dir: $common_dir, branch: $branch, head: $head,
+      --arg watched "$watched" --arg index_path "$index_path" --argjson profile "$EXPECTED_PERMISSION_PROFILE" \
+      '{repo: $repo, git_dir: $git_dir, common_dir: $common_dir, index_path: $index_path, branch: $branch, head: $head,
         codex_version: $codex_version, created_at: $created,
-        expected: {cwd: $repo, sandbox: $sandbox, approval: $approval},
+        expected: {cwd: $repo, sandbox: $sandbox, approval: $approval, permission_profile: $profile},
         watched: ($watched | split("\n") | map(select(length > 0)))}' > "$run/manifest.json"
 jq -n '{thread_id: null, last_round: 0}' > "$run/state.json"
 
+mkdir "$run/baseline"
 "$here/snapshot.sh" "$root" "$run/baseline" "$run/manifest.json"
 
 echo "RUN_DIR=$run"
