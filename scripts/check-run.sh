@@ -10,18 +10,20 @@ here=$(cd "$(dirname "$0")" && pwd -P)
 [ $# -ge 4 ] || { echo "用法：check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>" >&2; exit 2; }
 run=$1 n=$2 want=$3 want_thread=$4
 [[ "$n" =~ ^[1-9][0-9]*$ ]] || { echo "轮次必须是正整数：$n" >&2; exit 2; }
-acquire_lock "$run"
+verify_run "$run" "$want"
 m="$run/manifest.json" s="$run/state.json"
 ev="$run/events-$n.jsonl" rep="$run/report-$n.md"
 fail=0
 bad() { echo "FAIL: $*"; fail=1; }
 ok() { echo "ok:   $*"; }
 
-[ "$(sha_of "$m")" = "$want" ] || { echo "FAIL: manifest.json 哈希与会话记录不一致，停止检查"; exit 3; }
 repo=$(jq -r .repo "$m")
 tid=$(jq -r '.thread_id // empty' "$s")
 rc=$(cat "$run/exit-$n.txt" 2>/dev/null || echo '(无)')
 echo "repo=$repo thread=$want_thread exit=$rc"
+
+echo "=== 工具链"
+tools_unchanged "$m" && ok "工具链与基线一致" || bad "工具链与基线不同（路径或文件哈希变化）"
 
 echo "=== 进程与事件"
 [ "$rc" = 0 ] && ok "Codex 退出码为 0" || bad "Codex 退出码为 $rc"
@@ -69,9 +71,9 @@ echo "=== 仓库和配置对比（baseline vs 本次快照）"
 after=$(mktemp -d "$run/after-$n.XXXXXX") || { bad "无法创建快照目录"; exit 1; }
 echo "快照目录：$after"
 "$here/snapshot.sh" "$repo" "$after" "$m" || bad "快照失败"
-"$here/compare.sh" "$run/baseline" "$after" "$m" || fail=1
+"$here/compare.sh" "$run/baseline" "$after" || fail=1
 
-echo "=== sha256（与 new-run 输出及派单前记录对比）"
-(cd "$run" && shasum -a 256 baseline/* task-*.md)
+echo "=== sha256（任务文件，与启动前回显的值对比；基线已由 manifest 自动校验）"
+(cd "$run" && shasum -a 256 task-*.md)
 echo "=== 机械检查：$([ $fail = 0 ] && echo PASS || echo FAIL)"
 exit $fail

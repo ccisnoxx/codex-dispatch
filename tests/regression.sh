@@ -167,6 +167,64 @@ FAKE_VERSION="codex-cli 9.9.9" "$S/new-run.sh" "$(mkrepo)" > /dev/null 2>&1; res
 mkdir -p "$T/empty"; git -C "$T/empty" init -q; "$S/new-run.sh" "$T/empty" > /dev/null 2>&1; result "new-run 拒绝空仓库" 2 $?
 mkdir -p "$T/nogit"; "$S/new-run.sh" "$T/nogit" > /dev/null 2>&1; result "new-run 拒绝非 Git 目录" 2 $?
 
+echo "=== 符号链接、嵌套仓库与 submodule"
+mkdir -p "$T/outside/wdir" "$T/outside/tdir"; echo t > "$T/outside/tdir/file"; ln -s "$T/outside/tdir" "$T/outside/wdir/nested"
+scenario "监视目录内的目录符号链接，目标内容被改" 1 "echo changed > '$T/outside/tdir/file'" "$T/outside/wdir"
+mkdir -p "$T/outside/loopdir"; ln -s "$T/outside/loopdir" "$T/outside/loopdir/self"
+scenario "监视目录内有循环符号链接（无改动）" 0 ':' "$T/outside/loopdir"
+
+r=$(mkrepo); mv "$r/.git/hooks" "$T/outside/hooksdir"; ln -s "$T/outside/hooksdir" "$r/.git/hooks"; newrun "$r"
+FAKE_ACTION="echo '# x' >> '$T/outside/hooksdir/pre-commit'" round 1
+check 1 "$TID" "hooks-symlink"; result ".git/hooks 是符号链接，目标 hook 被改" 1 $?
+
+r=$(mkrepo); git init -q "$r/vendor"; echo v > "$r/vendor/v"; newrun "$r"
+FAKE_ACTION='echo w > vendor/v' round 1
+check 1 "$TID" "nested-repo"; result "改派单前已有的嵌套仓库内文件" 1 $?
+
+r=$(mkrepo); git -C "$r" update-index --add --cacheinfo "160000,$(git -C "$r" rev-parse HEAD),sub"; git -C "$r" commit -qm gitlink > /dev/null
+"$S/new-run.sh" "$r" > /dev/null 2>&1; rc=$?; result "submodule 状态无法采集时 new-run 失败" nonzero "$([ $rc -ne 0 ] && echo nonzero || echo 0)"
+
+echo "=== 运行目录身份与基线锚定"
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID
+mv "$RUN" "$RUN.moved"; ln -s "$RUN.moved" "$RUN"
+round 2 "$t1"; result "运行目录被换成符号链接，run.sh 拒绝" 3 "$RC"
+check 1 "$t1" "rundir-link"; result "运行目录被换成符号链接，check-run 拒绝" 3 $?
+result "被链接的目录中没有新产物" 0 "$(find "$RUN.moved" -maxdepth 1 -name 'pre-2' | wc -l | tr -d ' ')"
+
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID
+cp -Rp "$RUN" "$RUN.copy"; rm -rf "$RUN"; mv "$RUN.copy" "$RUN"
+round 2 "$t1"; result "运行目录被换成内容相同的副本，拒绝" 3 "$RC"
+
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID
+echo x >> "$RUN/baseline/head.txt"
+round 2 "$t1"; result "基线文件被篡改，run.sh 拒绝" 3 "$RC"
+check 1 "$t1" "baseline-tamper"; result "基线文件被篡改，check-run 拒绝" 3 $?
+
+echo "=== Codex 配置符号链接身份"
+mv "$CODEX_HOME/config.toml" "$T/cfg1.toml"; cp "$T/cfg1.toml" "$T/cfg2.toml"; ln -s "$T/cfg1.toml" "$CODEX_HOME/config.toml"
+r=$(mkrepo); newrun "$r"
+FAKE_ACTION="cp '$T/cfg1.toml' '$T/cfg2.toml'; ln -sfn '$T/cfg2.toml' \"\$CODEX_HOME/config.toml\"" round 1
+check 1 "$TID" "cfg-retarget"; result "Codex 配置链接改指向内容相同的文件" 1 $?
+rm "$CODEX_HOME/config.toml"; mv "$T/cfg1.toml" "$CODEX_HOME/config.toml"; rm -f "$T/cfg2.toml"
+
+echo "=== 输入校验与脱敏"
+"$S/new-run.sh" "$(mkrepo)" "$T/outside/$(printf 'watch\nfile')" > /dev/null 2>&1; result "监视路径含换行符，拒绝" 2 $?
+r=$(mkrepo); git -C "$r" config core.hooksPath /; "$S/new-run.sh" "$r" > /dev/null 2>&1; result "hooksPath 为 /，拒绝扫描" 2 $?
+mkdir -p "$T/outside/many"; for i in $(seq 1 20); do echo "$i" > "$T/outside/many/f$i"; done
+CODEX_DISPATCH_MAX_ENTRIES=10 "$S/new-run.sh" "$(mkrepo)" "$T/outside/many" > /dev/null 2>&1; rc=$?
+result "超出扫描上限时 new-run 失败" nonzero "$([ $rc -ne 0 ] && echo nonzero || echo 0)"
+r=$(mkrepo); git -C "$r" remote add scp token123@example.com:private/repo.git; git -C "$r" remote add web https://user:tok456@example.com/x.git
+git -C "$r" config demo.multiline "$(printf 'first\nSECRET-TOKEN')"; newrun "$r"
+result "快照中不含 remote 凭证" absent "$(grep -qE 'token123|tok456' "$RUN/baseline/remotes.txt" && echo present || echo absent)"
+result "快照中不含多行 config 值" absent "$(grep -q 'SECRET-TOKEN' "$RUN/baseline/config.txt" && echo present || echo absent)"
+result "remote 记录主机名" "example.com example.com" "$(awk '{print $3}' "$RUN/baseline/remotes.txt" | sort -u | head -1) $(awk '{print $3}' "$RUN/baseline/remotes.txt" | sort -u | tail -1)"
+
+echo "=== 工具链替换（放在最后，会改动假 codex）"
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID
+echo '# modified' >> "$T/bin/codex"
+round 2 "$t1"; result "工具链被替换，run.sh 拒绝" 4 "$RC"
+check 1 "$t1" "tools"; result "工具链被替换，check-run 判 FAIL" 1 $?
+
 echo "=== 合计：通过 ${pass}，不符 ${failn}"
 echo "临时目录：${T}（检查输出保留在其中，确认后可删除）"
 [ "$failn" = 0 ]

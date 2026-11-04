@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 对比两份快照：compare.sh <基线目录> <当前目录> <manifest.json>
+# 对比两份快照：compare.sh <基线目录> <当前目录>
 # 有任一 FAIL 时退出码为 1。工作树改动（status、worktree.patch、新文件）只展示，由 Claude 判断是否在范围内。
 set -uo pipefail
 export LC_ALL=C
-base=$1 cur=$2 manifest=$3
+base=$1 cur=$2
 fail=0
 bad() { echo "FAIL: $*"; fail=1; }
 ok() { echo "ok:   $*"; }
@@ -13,10 +13,9 @@ for f in head.txt index.patch index-entries.txt refs.txt stash.txt remotes.txt c
   if cmp -s "$base/$f" "$cur/$f"; then ok "$f 未变"; else bad "$f 有变化"; diff "$base/$f" "$cur/$f" | head -20; fi
 done
 
-# 只放过实际 index 文件的字节变化：条目不变时通常是普通 git status 刷新了 stat 缓存
-idx=" $(printf '%q' "$(jq -r .index_path "$manifest")")"
-not_index() { while IFS= read -r l; do [[ "$l" == *"$idx" ]] || printf '%s\n' "$l"; done < "$1"; }
-only_index() { while IFS= read -r l; do [[ "$l" == *"$idx" ]] && printf '%s\n' "$l"; done < "$1"; return 0; }
+# 只放过实际 index 文件（snaplib 标为 IDX）的字节变化：条目不变时通常是普通 git status 刷新了 stat 缓存
+not_index() { grep -v '^IDX ' "$1" || true; }
+only_index() { grep '^IDX ' "$1" || true; }
 admin_diff=$(diff <(not_index "$base/gitadmin.txt") <(not_index "$cur/gitadmin.txt"))
 if [ -z "$admin_diff" ]; then ok "Git 管理目录未变"; else bad "Git 管理目录有变化"; echo "$admin_diff" | head -30; fi
 if ! cmp -s <(only_index "$base/gitadmin.txt") <(only_index "$cur/gitadmin.txt"); then

@@ -27,13 +27,19 @@ Claude 主会话负责任务设计、方向决策和验收，Codex 在边界内�
 | `new-run.sh <仓库> [额外监视路径...]` | 检查依赖和 Codex 版本，建运行目录（权限 700），写入不可变的 `manifest.json` 和可变的 `state.json`，保存基线，输出 `MANIFEST_SHA` 和全部哈希 |
 | `run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> [THREAD_ID]` | 执行第 N 轮：先校验 manifest 和任务文件哈希、线程 ID（N>1 必填）、轮次连续性、本轮输出路径均不存在、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
 | `check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>` | 机械检查：Codex 退出码、事件、线程 ID、逐条断言实际权限、Git 状态和监视文件对比；快照写入随机命名的新目录 |
-| `snapshot.sh`、`compare.sh`、`common.sh` | 快照、对比和公共函数，由上面三个脚本调用 |
+| `snapshot.sh`、`compare.sh`、`common.sh`、`snaplib.py` | 快照、对比、公共函数和 Python 快照辅助，由上面三个脚本调用 |
 
 `tests/regression.sh` 用假的 `codex` 在隔离环境里验证上述检测能力，不调用真实模型。修改脚本或升级 Codex 后先跑它。
 
-**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身和目标的内容哈希；不存在、FIFO、socket 等类型分别记录。remote URL 去掉用户信息，config 只记录键名和值的哈希，避免凭证进入快照。**PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。
+**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身、解析后的目标和目标内容；指向目录的符号链接会递归记录目标目录，按设备号和 inode 检测循环，不跨文件系统下降；不存在、FIFO、socket 等类型分别记录。派单前已有的未跟踪目录（如嵌套仓库）递归记录内容，其中的 `.git/objects` 除外。remote 只记录名称、类型、主机名和 URL 哈希，config 只记录键名和值的哈希，避免凭证进入快照。
 
-Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[projects."<目录>"] trust_level = "trusted"`。所以这份配置按 TOML 解析后做规范化比较，只排除本仓库这一条，其他任何配置改动仍判为 FAIL；纯注释改动不计入。配置无法解析时，退回到逐字节比较。
+以下情况会**拒绝建立基线或判为 FAIL**（fail closed），而不是跳过：submodule 状态无法采集；监视路径含换行符；监视路径是 `/`、主目录，或仓库本身及其上级目录；单次扫描超过 20 万个条目或 4 GiB。
+
+运行目录的物理路径和 inode、基线文件哈希、工具链（`codex`、`git`、`jq`、`python3`、`shasum`、`bash`）的实际路径和文件哈希都写入 manifest，`run.sh` 和 `check-run.sh` 每次自动复核。
+
+**PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。工具链复核使用的是同一套工具，只能发现替换痕迹，不能抵御已被替换的工具伪造结果。
+
+Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[projects."<目录>"] trust_level = "trusted"`。所以这份配置按 TOML 解析后做规范化比较：本仓库条目恰好只有 `trust_level = "trusted"` 时才排除，其他任何配置改动仍判为 FAIL；纯注释改动不计入。配置是符号链接时，链接目标的变化也会被检出。配置无法解析时，退回到逐字节比较。
 
 ## 1. 派单前（按顺序）
 
@@ -50,7 +56,7 @@ Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[proje
    **被忽略的文件**（如 `.env`、本地数据库）的内容不在默认审计范围内。有限实施前，把其中关键的文件告诉用户；需要保护的，作为额外监视路径传给 `new-run.sh`。
 4. **处理分支。** 有限实施、当前在默认分支、且项目没有其他流程时，由 Claude `git switch -c <任务分支>`。建分支不等于获得 commit 授权。
 5. **单写入者。** 同一工作树同一时间只允许一个写入者。Codex 实施期间，Claude 不修改该工作树，也不派第二个可写任务。
-6. **建运行目录并保存基线。** 运行 `scripts/new-run.sh <仓库> [额外监视路径...]`，**输出必须完整留在会话里**：`RUN_DIR`、`MANIFEST_SHA`、基线哈希和脚本哈希。之后每条命令都写入运行目录的字面路径和 `MANIFEST_SHA` 的字面值。
+6. **建运行目录并保存基线。** 以物理绝对路径运行 `scripts/new-run.sh <仓库> [额外监视路径...]`，**输出必须完整留在会话里**：`RUN_DIR`、`MANIFEST_SHA` 和脚本哈希。基线文件的哈希已写入 manifest，随 `MANIFEST_SHA` 一起锚定。之后每条命令都写入运行目录的字面路径和 `MANIFEST_SHA` 的字面值。
 7. **写任务文件** `<运行目录>/task-N.md`，启动前用 `shasum -a 256` 回显它的哈希，作为 `run.sh` 的 `TASK_SHA` 参数。
 
 根因或方案不明确时，先派只读调查；目标和方案都已明确时，直接派实施。
@@ -130,7 +136,7 @@ Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[proje
 **每次运行 `run.sh` 或 `check-run.sh` 之前**，先直接运行下面的命令，与会话里 `new-run.sh` 输出的脚本哈希逐个对比；不一致就停止，不要调用这些脚本。脚本无法可靠地自我校验，被改过的检查器可以伪造结果。
 
 ```bash
-shasum -a 256 ~/.claude/skills/codex-dispatch/scripts/*.sh
+shasum -a 256 ~/.claude/skills/codex-dispatch/scripts/*.sh ~/.claude/skills/codex-dispatch/scripts/*.py
 ```
 
 ```bash
@@ -140,7 +146,7 @@ scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <THREAD_ID>   # N>1
 
 - **只读调查**可以前台运行。**有限实施**一律用 Bash 的 `run_in_background`，避免前台 10 分钟超时把 Codex 中断在写到一半的状态。
 - 进程是否结束，以 Claude Code 后台任务的结束通知为准；`pgrep` 只作辅助诊断。结束不代表成功。
-- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本、轮次不符，或本轮输出路径已存在）、3（manifest、任务文件或线程 ID 与会话记录不符）、4（运行前检查发现仓库、分支、HEAD 或 Git 元数据已变）、5（运行目录被占用，存在 `.lock`）。拒绝时不要绕过，按第 4 节的越界规则处理；`.lock` 只有在确认没有其他进程使用时才能手动删除。
+- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本、轮次不符，或本轮输出路径已存在）、3（运行目录被替换或不是物理路径，或 manifest、基线、任务文件、线程 ID 与会话记录不符）、4（运行前检查发现仓库、分支、HEAD、Git 元数据或工具链已变）、5（运行目录被占用，存在 `.lock`）。拒绝时不要绕过，按第 4 节的越界规则处理；`.lock` 只有在确认没有其他进程使用时才能手动删除。
 - 首轮结束后，线程 ID 写进 `state.json` 并输出出来。把它记在会话里，后续轮次和 `check-run.sh` 都以参数形式传入会话里的值，脚本会与 `state.json` 和 events 比对。`manifest.json` 创建后不再改动。
 - 脚本不传沙箱参数，`resume` 也一样。`resume` 子命令本身不定义 `-C`，脚本用子 shell `cd` 进入仓库。
 
@@ -154,7 +160,7 @@ scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <THREAD_ID>   # N>1
    - 每条 `turn_context` 的 `cwd`、`sandbox_policy`、`approval_policy`、`permission_profile` 都与 manifest 中的期望值一致；
    - 开头“覆盖范围”所列的仓库状态和监视路径都与基线一致。
    输出 `WARN: index 文件字节变化但条目一致` 时，通常是有人运行了普通的 `git status`，不算越界；但如果用户的 IDE 等工具同时在操作这个仓库，任何 FAIL 都要先排除它们的影响再下结论。
-2. **核对哈希。** 把输出的 sha256 与会话里 `new-run.sh` 和启动前回显的值逐个对比。基线或任务文件的哈希变了，就判定证据被篡改。线程 ID 以会话里记录的值为准。
+2. **核对哈希。** 基线文件已由脚本对照 manifest 自动校验。把输出的任务文件 sha256 与启动前回显的值逐个对比，变了就判定证据被篡改。线程 ID 以会话里记录的值为准。
 3. **逐条判断条目级 error。** 不按字符串自动忽略。Codex 0.166.0 下，`item.type == "error"` 且内容为 “Under-development features enabled: …” 的条目是已知的配置警告（本机已设置 `suppress_unstable_features_warning = true`，正常情况下不应再出现）；其他内容都要看是否影响本次任务。
 4. **判断改动范围。** 读 `git diff`、新增的未跟踪文件和 status 差异，确认都在允许范围内。
 5. **核对仓库外操作。** Codex 报告了仓库外改动或联网操作的，逐项核实影响；events 里的命令记录显示有、报告却没写的，按越界处理。
