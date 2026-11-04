@@ -18,20 +18,20 @@ Claude 主会话负责任务设计、方向决策和验收，Codex 在边界内�
 - 运行目录、基线和脚本都可能被 Codex 改动。可信的锚点只有已经出现在 Claude 会话中的哈希和输出。
 - 推荐在一次性虚拟机、容器，或不含敏感凭证的环境里使用。在本机直接使用是用户已接受的风险。
 
-**适用范围：** macOS、Linux 或 WSL 上的 Bash，需要 `git`（2.31 及以上）、`jq`、`shasum`、`python3`（3.11 及以上，用于解析 TOML）。脚本只接受 `common.sh` 中登记过的 Codex 版本（目前为 0.166.0），版本不符时 `new-run.sh` 会拒绝执行。升级后先核对 CLI help、JSONL 事件结构和 `turn_context` 结构，跑一遍 `tests/regression.sh`，再登记新版本。回归测试已在 macOS（git 2.54、jq 1.8.1、Python 3.12）和 Debian bookworm aarch64（git 2.39.5、jq 1.6、Python 3.11.2）上通过；WSL 未实测。
+**适用范围：** macOS、Linux 或 WSL 上的 Bash，需要 `git`（2.31 及以上）、`jq`、`shasum`、`python3`（3.11 及以上，用于解析 TOML）。脚本只接受 `common.sh` 中登记过的 Codex 版本（目前为 0.166.0），版本不符时 `new-run.sh` 会拒绝执行。升级后先核对 CLI help、JSONL 事件结构和 `turn_context` 结构，跑一遍 `tests/regression.sh`，再登记新版本。回归测试已在 macOS（git 2.54、jq 1.8.1、Python 3.12）上通过；上一版脚本还在 Debian bookworm aarch64（git 2.39.5、jq 1.6、Python 3.11.2）上通过，当前版本尚未在 Linux 上复测；WSL 未实测。
 
 脚本在 `~/.claude/skills/codex-dispatch/scripts/`（下文简写为 `scripts/`）：
 
 | 脚本 | 用途 |
 | --- | --- |
 | `new-run.sh <仓库> [额外监视路径...]` | 检查依赖和 Codex 版本，建运行目录（权限 700），写入不可变的 `manifest.json` 和可变的 `state.json`，保存基线，输出 `MANIFEST_SHA` 和全部哈希 |
-| `run.sh <运行目录> <N> <MANIFEST_SHA>` | 执行第 N 轮：先校验 manifest 哈希、轮次连续性、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
-| `check-run.sh <运行目录> <N> <MANIFEST_SHA>` | 机械检查：事件、逐条断言实际权限、Git 状态和监视文件对比 |
+| `run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> [THREAD_ID]` | 执行第 N 轮：先校验 manifest 和任务文件哈希、线程 ID（N>1 必填）、轮次连续性、本轮输出路径均不存在、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
+| `check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>` | 机械检查：Codex 退出码、事件、线程 ID、逐条断言实际权限、Git 状态和监视文件对比；快照写入随机命名的新目录 |
 | `snapshot.sh`、`compare.sh`、`common.sh` | 快照、对比和公共函数，由上面三个脚本调用 |
 
 `tests/regression.sh` 用假的 `codex` 在隔离环境里验证上述检测能力，不调用真实模型。修改脚本或升级 Codex 后先跑它。
 
-**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件（reflog、hooks 及其权限、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。**PASS 不代表**被忽略文件的内容、未登记的外部文件或外部副作用没有变化。
+**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身和目标的内容哈希；不存在、FIFO、socket 等类型分别记录。remote URL 去掉用户信息，config 只记录键名和值的哈希，避免凭证进入快照。**PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。
 
 Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[projects."<目录>"] trust_level = "trusted"`。所以这份配置按 TOML 解析后做规范化比较，只排除本仓库这一条，其他任何配置改动仍判为 FAIL；纯注释改动不计入。配置无法解析时，退回到逐字节比较。
 
@@ -51,7 +51,7 @@ Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[proje
 4. **处理分支。** 有限实施、当前在默认分支、且项目没有其他流程时，由 Claude `git switch -c <任务分支>`。建分支不等于获得 commit 授权。
 5. **单写入者。** 同一工作树同一时间只允许一个写入者。Codex 实施期间，Claude 不修改该工作树，也不派第二个可写任务。
 6. **建运行目录并保存基线。** 运行 `scripts/new-run.sh <仓库> [额外监视路径...]`，**输出必须完整留在会话里**：`RUN_DIR`、`MANIFEST_SHA`、基线哈希和脚本哈希。之后每条命令都写入运行目录的字面路径和 `MANIFEST_SHA` 的字面值。
-7. **写任务文件** `<运行目录>/task-N.md`，启动前用 `shasum -a 256` 回显它的哈希。
+7. **写任务文件** `<运行目录>/task-N.md`，启动前用 `shasum -a 256` 回显它的哈希，作为 `run.sh` 的 `TASK_SHA` 参数。
 
 根因或方案不明确时，先派只读调查；目标和方案都已明确时，直接派实施。
 
@@ -134,23 +134,24 @@ shasum -a 256 ~/.claude/skills/codex-dispatch/scripts/*.sh
 ```
 
 ```bash
-scripts/run.sh <运行目录> <N> <MANIFEST_SHA>
+scripts/run.sh <运行目录> 1 <MANIFEST_SHA> <TASK_SHA>
+scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <THREAD_ID>   # N>1
 ```
 
 - **只读调查**可以前台运行。**有限实施**一律用 Bash 的 `run_in_background`，避免前台 10 分钟超时把 Codex 中断在写到一半的状态。
 - 进程是否结束，以 Claude Code 后台任务的结束通知为准；`pgrep` 只作辅助诊断。结束不代表成功。
-- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本或轮次不符）、3（manifest 哈希不符）、4（运行前检查发现仓库、分支、HEAD 或 Git 元数据已变）。拒绝时不要绕过，按第 4 节的越界规则处理。
-- 首轮结束后，线程 ID 写进 `state.json` 并输出出来。把它记在会话里，后续以会话里的值为准。`manifest.json` 创建后不再改动。
+- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本、轮次不符，或本轮输出路径已存在）、3（manifest、任务文件或线程 ID 与会话记录不符）、4（运行前检查发现仓库、分支、HEAD 或 Git 元数据已变）、5（运行目录被占用，存在 `.lock`）。拒绝时不要绕过，按第 4 节的越界规则处理；`.lock` 只有在确认没有其他进程使用时才能手动删除。
+- 首轮结束后，线程 ID 写进 `state.json` 并输出出来。把它记在会话里，后续轮次和 `check-run.sh` 都以参数形式传入会话里的值，脚本会与 `state.json` 和 events 比对。`manifest.json` 创建后不再改动。
 - 脚本不传沙箱参数，`resume` 也一样。`resume` 子命令本身不定义 `-C`，脚本用子 shell `cd` 进入仓库。
 
 ## 4. 验收
 
 **退出码和 Codex 的报告都不能作为通过依据。**
 
-1. **机械检查。** 先按第 3 节复核脚本哈希，再运行 `scripts/check-run.sh <运行目录> <N> <MANIFEST_SHA>`，结果为 FAIL 就不算通过。它检查以下内容：
+1. **机械检查。** 先按第 3 节复核脚本哈希，再运行 `scripts/check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>`，结果为 FAIL 就不算通过。它检查以下内容：
    - manifest 哈希与会话记录一致（不一致时直接退出 3）；
-   - JSONL 可解析，线程 ID 一致，最后终止事件为 `turn.completed`，没有 `turn.failed` 和顶层 `error`，报告非空；
-   - 每条 `turn_context` 的 `cwd`、`sandbox_policy`、`approval_policy` 都与 manifest 中的期望值一致；
+   - Codex 退出码为 0；JSONL 可解析，`state.json` 和 events 中的线程 ID 都与会话记录一致，最后终止事件为 `turn.completed`，没有 `turn.failed` 和顶层 `error`，报告非空；
+   - 每条 `turn_context` 的 `cwd`、`sandbox_policy`、`approval_policy`、`permission_profile` 都与 manifest 中的期望值一致；
    - 开头“覆盖范围”所列的仓库状态和监视路径都与基线一致。
    输出 `WARN: index 文件字节变化但条目一致` 时，通常是有人运行了普通的 `git status`，不算越界；但如果用户的 IDE 等工具同时在操作这个仓库，任何 FAIL 都要先排除它们的影响再下结论。
 2. **核对哈希。** 把输出的 sha256 与会话里 `new-run.sh` 和启动前回显的值逐个对比。基线或任务文件的哈希变了，就判定证据被篡改。线程 ID 以会话里记录的值为准。
