@@ -27,15 +27,17 @@ Claude 主会话负责任务设计、方向决策和验收，Codex 在边界内�
 | `new-run.sh <仓库> [额外监视路径...]` | 检查依赖和 Codex 版本，建运行目录（权限 700），写入不可变的 `manifest.json` 和可变的 `state.json`，保存基线，输出 `MANIFEST_SHA` 和全部哈希 |
 | `run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> [THREAD_ID]` | 执行第 N 轮：先校验 manifest 和任务文件哈希、线程 ID（N>1 必填）、轮次连续性、本轮输出路径均不存在、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
 | `check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>` | 机械检查：Codex 退出码、事件、线程 ID、逐条断言实际权限、Git 状态和监视文件对比；快照写入随机命名的新目录 |
-| `snapshot.sh`、`compare.sh`、`common.sh`、`snaplib.py` | 快照、对比、公共函数和 Python 快照辅助，由上面三个脚本调用 |
+| `snapshot.sh`、`common.sh`、`snaplib.py` | 快照、公共函数和 Python 辅助（快照、对比、监视清单、写报告），由上面三个脚本调用 |
 
 `tests/regression.sh` 用假的 `codex` 在隔离环境里验证上述检测能力，不调用真实模型。修改脚本或升级 Codex 后先跑它。
 
-**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身、解析后的目标和目标内容；指向目录的符号链接会递归记录目标目录，按设备号和 inode 检测循环，不跨文件系统下降；不存在、FIFO、socket 等类型分别记录。派单前已有的未跟踪目录（如嵌套仓库）递归记录内容，其中的 `.git/objects` 除外。remote 只记录名称、类型、主机名和 URL 哈希，config 只记录键名和值的哈希，避免凭证进入快照。
+**`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身、解析后的目标和目标内容；指向目录的符号链接会递归记录目标目录，按设备号和 inode 检测循环，不跨文件系统下降；不存在、FIFO、socket 等类型分别记录。派单前已有的未跟踪目录（如嵌套仓库）递归记录内容，其中的 `.git/objects` 除外；这些目录中出现新内容同样判 FAIL。每个已初始化 submodule 的 HEAD、分支、工作树 status 和 diff 哈希逐个记录，不受 `submodule.*.ignore` 影响。监视清单包含所有生效的 Git 配置文件，以及 `include.path`、`includeIf.*.path` 指向的文件（即使为空或不存在）。Git 管理目录只跳过真正的对象库（Git 目录直属的 `objects`、`modules/` 下子仓库的 `objects`、`lfs/objects`）。remote 只记录名称、类型、主机名和 URL 哈希，config 只记录键名和值的哈希，避免凭证进入快照。
 
 以下情况会**拒绝建立基线或判为 FAIL**（fail closed），而不是跳过：submodule 状态无法采集；监视路径含换行符；监视路径是 `/`、主目录，或仓库本身及其上级目录；单次扫描超过 20 万个条目或 4 GiB。
 
-运行目录的物理路径和 inode、基线文件哈希、工具链（`codex`、`git`、`jq`、`python3`、`shasum`、`bash`）的实际路径和文件哈希都写入 manifest，`run.sh` 和 `check-run.sh` 每次自动复核。
+运行目录的物理路径和身份（设备号、inode、所有者、权限位）、基线文件哈希、工具链（`codex`、`git`、`jq`、`python3`、`shasum`、`bash`）的实际路径和文件哈希都写入 manifest，`run.sh` 和 `check-run.sh` 每次自动复核。决定 PASS/FAIL 的比对全部在 `snaplib.py` 中完成，判定路径上只使用 bash 内建命令和上述登记过的工具，不依赖 `cmp`、`diff`、`grep` 等未登记命令。
+
+报告不再由 `codex exec -o` 写入，而是由 `run.sh` 从 JSONL 中提取最后一条消息，以独占、不跟随符号链接的方式创建；`check-run.sh` 要求 events、报告、退出码和 stderr 都是普通文件。
 
 **PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。工具链复核使用的是同一套工具，只能发现替换痕迹，不能抵御已被替换的工具伪造结果。
 
