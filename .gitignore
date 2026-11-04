@@ -1,0 +1,23 @@
+# 本地系统与编辑器文件
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# 本地凭证与环境配置
+.env
+.env.*
+!.env.example
+
+# 运行证据应保存在仓库外，避免误上传日志和会话内容
+/.cache/
+/runs/
+/run.*/
+events-*.jsonl
+rollout-*.jsonl
+stderr-*.log
+
+# Python 临时产物
+__pycache__/
+*.py[cod]
