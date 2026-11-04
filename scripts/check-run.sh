@@ -5,7 +5,7 @@
 set -uo pipefail
 umask 077
 export LC_ALL=C
-here=$(cd "$(dirname "$0")" && pwd -P)
+here=$(cd "${0%/*}" && pwd -P)
 . "$here/common.sh"
 [ $# -ge 4 ] || { echo "用法：check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>" >&2; exit 2; }
 run=$1 n=$2 want=$3 want_thread=$4
@@ -19,36 +19,41 @@ ok() { echo "ok:   $*"; }
 
 repo=$(jq -r .repo "$m")
 tid=$(jq -r '.thread_id // empty' "$s")
-rc=$(cat "$run/exit-$n.txt" 2>/dev/null || echo '(无)')
+rc="(无)"; [ -f "$run/exit-$n.txt" ] && [ ! -L "$run/exit-$n.txt" ] && rc=$(<"$run/exit-$n.txt")
 echo "repo=$repo thread=$want_thread exit=$rc"
 
-echo "=== 工具链"
+echo "=== 工具链与证据文件"
 tools_unchanged "$m" && ok "工具链与基线一致" || bad "工具链与基线不同（路径或文件哈希变化）"
+if regular=$(snaplib regular "$ev" "$rep" "$run/exit-$n.txt" "$run/stderr-$n.log"); then
+  ok "本轮证据文件都是普通文件"
+else
+  bad "本轮证据文件异常"; echo "$regular"
+fi
 
 echo "=== 进程与事件"
 [ "$rc" = 0 ] && ok "Codex 退出码为 0" || bad "Codex 退出码为 $rc"
 [ "$tid" = "$want_thread" ] && ok "state.json 线程 ID 与会话记录一致" || bad "state.json 线程 ID=$tid，会话记录=$want_thread"
 if jq -s empty "$ev" 2>/dev/null; then ok "JSONL 可解析"; else bad "JSONL 无法解析或不存在"; fi
-ev_tid=$(jq -r 'select(.type=="thread.started") | .thread_id' "$ev" 2>/dev/null | head -1)
+ev_tid=$(jq -sr '[.[] | select(.type=="thread.started") | .thread_id] | first // ""' "$ev" 2>/dev/null)
 [ "$ev_tid" = "$want_thread" ] && ok "events 线程 ID 与会话记录一致" || bad "events 线程 ID=$ev_tid，会话记录=$want_thread"
 term=$(jq -sr '[.[] | select(.type=="turn.completed" or .type=="turn.failed")] | last.type // ""' "$ev" 2>/dev/null)
 [ "$term" = "turn.completed" ] && ok "最后终止事件为 turn.completed" || bad "最后终止事件为 '${term:-无}'"
-nfail=$(jq -s '[.[] | select(.type=="turn.failed")] | length' "$ev" 2>/dev/null || echo 1)
+nfail=$(jq -s '[.[] | select(.type=="turn.failed")] | length' "$ev" 2>/dev/null) || nfail=1
 [ "$nfail" = 0 ] && ok "无 turn.failed" || bad "turn.failed 数量 $nfail"
-nerr=$(jq -s '[.[] | select(.type=="error")] | length' "$ev" 2>/dev/null || echo 1)
+nerr=$(jq -s '[.[] | select(.type=="error")] | length' "$ev" 2>/dev/null) || nerr=1
 [ "$nerr" = 0 ] && ok "无顶层 error" || bad "顶层 error 数量 $nerr"
 [ -s "$rep" ] && ok "报告非空" || bad "报告为空或不存在"
 echo "--- 条目级 error（需人工判断，不自动忽略）"
-jq -c 'select(.item.type? == "error") | .item.message // .item' "$ev" 2>/dev/null | cut -c1-300
+jq -c 'select(.item.type? == "error") | (.item.message // .item | tostring | .[0:300])' "$ev" 2>/dev/null
 
 echo "=== 实际生效的权限（session turn_context，逐条断言）"
-sf=$(find "$(codex_home)/sessions" -name "*${want_thread}*.jsonl" 2>/dev/null | head -1)
+sf=$(snaplib session "$(codex_home)" "$want_thread")
 if [ -z "$sf" ]; then
   bad "找不到线程对应的 session 文件"
 else
   ctxs=$(jq -c 'select(.type=="turn_context") | .payload | {cwd, sandbox: .sandbox_policy.type, approval: .approval_policy, permission_profile}' "$sf")
   echo "$ctxs"
-  cnt=$(printf '%s\n' "$ctxs" | grep -c . || true)
+  cnt=$(jq -s 'length' <<<"$ctxs")
   [ "$cnt" -ge "$n" ] && ok "turn_context 共 $cnt 条（本轮为第 $n 轮）" || bad "turn_context 只有 $cnt 条，少于轮次 $n"
   exp_cwd=$(jq -r .expected.cwd "$m") exp_sb=$(jq -r .expected.sandbox "$m") exp_ap=$(jq -r .expected.approval "$m")
   exp_pp=$(jq -cS .expected.permission_profile "$m")
@@ -68,10 +73,13 @@ fi
 echo "=== 仓库和配置对比（baseline vs 本次快照）"
 [ "$(safe_git "$repo" symbolic-ref -q --short HEAD || echo '(detached)')" = "$(jq -r .branch "$m")" ] && ok "分支与基线一致" || bad "分支与基线不同"
 # 快照目录用随机名新建，Codex 无法预先放置同名符号链接
-after=$(mktemp -d "$run/after-$n.XXXXXX") || { bad "无法创建快照目录"; exit 1; }
+after=$(snaplib mkdtemp "$run" "after-$n.") || { bad "无法创建快照目录"; exit 1; }
 echo "快照目录：$after"
-"$here/snapshot.sh" "$repo" "$after" "$m" || bad "快照失败"
-"$here/compare.sh" "$run/baseline" "$after" || fail=1
+if "$here/snapshot.sh" "$repo" "$after" "$m"; then
+  snaplib compare "$run/baseline" "$after" || fail=1
+else
+  bad "快照失败"
+fi
 
 echo "=== sha256（任务文件，与启动前回显的值对比；基线已由 manifest 自动校验）"
 (cd "$run" && shasum -a 256 task-*.md)

@@ -57,10 +57,10 @@ newrun() { "$S/new-run.sh" "$@" > "$T/nr.txt" 2>&1 || return 1; RUN=$(sed -n 's/
 # 执行一轮：round <N> [线程ID]；设置 RC、TID
 round() {
   local n=$1; [ -e "$RUN/task-$n.md" ] || echo "task $n" > "$RUN/task-$n.md"
-  "$S/run.sh" "$RUN" "$n" "$M" "$(sha "$RUN/task-$n.md")" ${2:+"$2"} > "$T/run.txt" 2>&1; RC=$?
+  PATH="${PRE:-}$PATH" "$S/run.sh" "$RUN" "$n" "$M" "$(sha "$RUN/task-$n.md")" ${2:+"$2"} > "$T/run.txt" 2>&1; RC=$?
   TID=$(sed -n 's/^ROUND=.* THREAD_ID=//p' "$T/run.txt")
 }
-check() { "$S/check-run.sh" "$RUN" "$1" "$M" "$2" > "$T/check-${3//\//_}.txt" 2>&1; }
+check() { PATH="${PRE:-}$PATH" "$S/check-run.sh" "$RUN" "$1" "$M" "$2" > "$T/check-${3//\//_}.txt" 2>&1; }
 
 scenario() {  # scenario <名称> <期望退出码> <FAKE_ACTION> [额外监视路径...]
   local name=$1 want=$2 action=$3; shift 3
@@ -218,6 +218,42 @@ git -C "$r" config demo.multiline "$(printf 'first\nSECRET-TOKEN')"; newrun "$r"
 result "快照中不含 remote 凭证" absent "$(grep -qE 'token123|tok456' "$RUN/baseline/remotes.txt" && echo present || echo absent)"
 result "快照中不含多行 config 值" absent "$(grep -q 'SECRET-TOKEN' "$RUN/baseline/config.txt" && echo present || echo absent)"
 result "remote 记录主机名" "example.com example.com" "$(awk '{print $3}' "$RUN/baseline/remotes.txt" | sort -u | head -1) $(awk '{print $3}' "$RUN/baseline/remotes.txt" | sort -u | tail -1)"
+
+echo "=== 第三轮复审场景"
+mkdir -p "$T/shim"
+shims='for c in cmp diff comm grep head tail cut sed sort find cat ls mktemp mv dirname; do printf "#!/bin/sh\nexit 0\n" > "$T/shim/$c"; chmod +x "$T/shim/$c"; done'
+PRE="$T/shim:" scenario "替换未登记命令并改全局 Git config" 1 "$shims; git config --global core.editor evil"
+for c in cmp diff comm grep head tail cut sed sort find cat ls mktemp mv dirname; do rm -f "$T/shim/$c"; done
+
+: > "$T/outside/empty-include.cfg"; git config --global include.path "$T/outside/empty-include.cfg"
+scenario "改基线时为空的 include 文件" 1 "printf '[core]\n\teditor = evil\n' > '$T/outside/empty-include.cfg'"
+git config --global --unset include.path
+
+mkdir -p "$T/subsrc"; git -C "$T/subsrc" init -q; echo s > "$T/subsrc/f"; git -C "$T/subsrc" add f; git -C "$T/subsrc" commit -qm s > /dev/null
+mksub() { local r; r=$(mkrepo); git -C "$r" -c protocol.file.allow=always submodule add -q "$T/subsrc" sub > /dev/null 2>&1; git -C "$r" commit -qm sub > /dev/null; git -C "$r" config submodule.sub.ignore all; echo "$r"; }
+r=$(mksub); newrun "$r"; round 1; check 1 "$TID" "sub-clean"; result "有 submodule 且无改动" 0 $?
+r=$(mksub); newrun "$r"; FAKE_ACTION='echo x >> sub/f' round 1; check 1 "$TID" "sub-dirty"
+result "改 submodule 工作树（ignore=all）" 1 $?
+
+r=$(mkrepo); git init -q "$r/vendor"; echo v > "$r/vendor/v"; newrun "$r"
+FAKE_ACTION='echo n > vendor/newfile' round 1; check 1 "$TID" "nested-new"; result "派单前已有的嵌套仓库中新增文件" 1 $?
+
+r=$(mkrepo); mkdir -p "$r/.git/hooks/objects"; echo x > "$r/.git/hooks/objects/x"; newrun "$r"
+FAKE_ACTION='echo y > .git/hooks/objects/x' round 1; check 1 "$TID" "hooks-objects"; result "改 .git/hooks/objects 中的文件" 1 $?
+
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID; chmod 777 "$RUN"
+round 2 "$t1"; result "运行目录权限被放宽，run.sh 拒绝" 3 "$RC"
+check 1 "$t1" "rundir-mode"; result "运行目录权限被放宽，check-run 拒绝" 3 $?
+
+r=$(mkrepo); newrun "$r"; echo keep > "$T/outside/report-target"
+FAKE_ACTION="ln -s '$T/outside/report-target' '$RUN/report-1.md'" round 1
+result "执行中报告被换成符号链接，run.sh 拒绝" 3 "$RC"
+result "报告链接目标未被覆盖" keep "$(cat "$T/outside/report-target")"
+check 1 "$TID" "report-link"; result "报告是符号链接，check-run 判 FAIL" 1 $?
+
+r=$(mkrepo); newrun "$r"; round 1; t1=$TID
+mv "$RUN/state.json" "$T/outside/state.json"; ln -s "$T/outside/state.json" "$RUN/state.json"
+round 2 "$t1"; result "state.json 被换成符号链接，拒绝" 3 "$RC"
 
 echo "=== 工具链替换（放在最后，会改动假 codex）"
 r=$(mkrepo); newrun "$r"; round 1; t1=$TID
