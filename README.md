@@ -20,7 +20,7 @@ Claude 负责全局决策、任务设计、上下文整理、风险判断和独�
 | Claude Code | 能加载本地 Skill，并运行 Bash 命令与后台任务 |
 | Codex CLI | 当前脚本仅接受 `codex-cli 0.166.0`，需先完成自己的登录与配置 |
 | Shell | macOS、Linux 或 WSL 上的 Bash；WSL 尚未实测 |
-| Git | 2.31 及以上；目标仓库至少有一条提交 |
+| Git | 2.31 及以上；目标仓库至少有一条提交；不支持已跟踪文件使用必需 filter 的仓库（如 Git LFS） |
 | Python | 3.11 及以上，用于通过 `tomllib` 解析 TOML |
 | 其他命令 | `jq`、`shasum` 和常用 Unix 命令 |
 
@@ -55,8 +55,8 @@ git clone https://github.com/ccisnoxx/codex-dispatch.git ~/.claude/skills/codex-
 | 文件 | 用途 |
 | --- | --- |
 | `scripts/new-run.sh` | 检查依赖和 Codex 版本，建立运行目录、manifest 与基线 |
-| `scripts/run.sh` | 校验 manifest、任务文件哈希和线程 ID 及基线后执行任务；后续轮次续跑原线程 |
-| `scripts/check-run.sh` | 检查退出码、事件、线程 ID、实际权限、Git 状态与监视文件 |
+| `scripts/run.sh` | 校验 manifest、任务文件哈希、模式、线程 ID、仓库级锁及基线后执行任务；后续轮次续跑原线程 |
+| `scripts/check-run.sh` | 检查退出码、事件协议、session、线程 ID、实际权限、Git 状态、已跟踪文件与监视文件 |
 | `scripts/snapshot.sh` | 采集仓库及监视路径快照 |
 | `scripts/common.sh` | 支持版本、权限期望值、工具链清单及公共函数 |
 | `scripts/snaplib.py` | Python 辅助：递归哈希（跟随符号链接、防循环、扫描上限）、快照对比、监视清单、脱敏、写报告、工具链与运行目录身份 |
@@ -72,7 +72,7 @@ git clone https://github.com/ccisnoxx/codex-dispatch.git ~/.claude/skills/codex-
 bash tests/regression.sh
 ```
 
-测试使用假 `codex` 和隔离的临时 HOME、Codex 配置及 Git 仓库，不调用真实模型。它覆盖 Git 元数据变化、监视文件变化、权限不符、证据篡改、输出路径和运行目录被符号链接重定向、目录符号链接与嵌套仓库、submodule 采集失败与工作树改动、空 include 文件、未登记命令被替换、凭证脱敏、扫描上限、工具链替换、版本检查和同线程续跑等场景。临时检查输出会保留，路径在测试末尾打印。
+测试使用假 `codex` 和隔离的临时 HOME、Codex 配置及 Git 仓库，不调用真实模型。它覆盖 Git 元数据变化、监视文件变化、权限不符、证据篡改、输出路径和运行目录被符号链接重定向、目录符号链接与嵌套仓库、submodule 采集失败与工作树改动、空 include 文件、未登记命令被替换、只读与写入模式、事件协议与 session 校验、仓库级锁、凭证脱敏、扫描上限、工具链替换、版本检查和同线程续跑等场景。临时检查输出会保留，路径在测试末尾打印。
 
 这份回归测试验证脚本的检查能力；真实任务是否满足需求，仍需 Claude 根据实际实现和测试证据验收。
 

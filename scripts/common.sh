@@ -32,10 +32,31 @@ safe_git() {
   GIT_OPTIONAL_LOCKS=0 git "${args[@]}" -C "$repo" "$@"
 }
 
-# 运行目录的互斥锁，防止同一运行目录被并发操作；退出时释放
+# 退出时统一释放本进程获得的锁
+LOCKS_HELD=()
+release_locks() { local l; for l in "${LOCKS_HELD[@]}"; do rm -rf -- "$l"; done; }
+trap release_locks EXIT
+
+# 运行目录的互斥锁，防止同一运行目录被并发操作
 acquire_lock() {
   mkdir "$1/.lock" 2>/dev/null || { echo "运行目录正被占用（$1/.lock 已存在）；确认没有其他进程在用后再手动删除" >&2; exit 5; }
-  trap 'rmdir "'"$1"'/.lock" 2>/dev/null' EXIT
+  LOCKS_HELD+=("$1/.lock")
+}
+
+# 仓库级锁：同一仓库同一时间只允许一个 run.sh 或 check-run.sh 运行，防止两个任务同时写入或检查期间被改动
+acquire_repo_lock() {
+  local repo=$1 run=$2 id dir
+  id=$(snaplib identity "$repo") || exit 5
+  mkdir -p "$HOME/.cache/codex-dispatch/locks"
+  dir="$HOME/.cache/codex-dispatch/locks/${id%%:*}-$(id=${id#*:}; printf '%s' "${id%%:*}").lock"
+  if ! mkdir "$dir" 2>/dev/null; then
+    echo "仓库正被另一个派单任务占用（$dir）：" >&2
+    [ -f "$dir/owner" ] && echo "  $(<"$dir/owner")" >&2
+    echo "确认对应进程已结束后再手动删除该目录" >&2
+    exit 5
+  fi
+  LOCKS_HELD+=("$dir")
+  printf 'pid=%s run=%s repo=%s\n' "$$" "$run" "$repo" > "$dir/owner"
 }
 
 # run.sh 和 check-run.sh 共用：校验运行目录本身、manifest、state 和基线都与会话记录一致，然后加锁。

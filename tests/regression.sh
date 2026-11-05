@@ -20,8 +20,9 @@ cwd=$PWD tid="" out=""
 [ "$1" = "resume" ] && { tid=$2; shift 2; }
 while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; *) shift ;; esac; done
 cat > /dev/null
-[ -n "$tid" ] || tid="fake-$RANDOM$RANDOM-$$"
+[ -n "$tid" ] || tid=$(python3 -c 'import uuid; print(uuid.uuid4())')
 sdir="$CODEX_HOME/sessions/2026/11/03"; mkdir -p "$sdir"
+[ -e "$sdir/rollout-x-$tid.jsonl" ] || printf '{"type":"session_meta","payload":{"id":"%s"}}\n' "${FAKE_META_ID:-$tid}" > "$sdir/rollout-x-$tid.jsonl"
 printf '{"type":"turn_context","payload":{"cwd":"%s","sandbox_policy":{"type":"%s"},"approval_policy":"%s","permission_profile":%s}}\n' \
   "${FAKE_CWD:-$(cd "$cwd" && pwd -P)}" "${FAKE_SANDBOX:-danger-full-access}" "${FAKE_APPROVAL:-never}" \
   "${FAKE_PROFILE:-{\"type\":\"disabled\"}}" >> "$sdir/rollout-x-$tid.jsonl"
@@ -29,9 +30,17 @@ printf '{"type":"turn_context","payload":{"cwd":"%s","sandbox_policy":{"type":"%
 real=$(cd "$cwd" && pwd -P)
 grep -qF "[projects.\"$real\"]" "$CODEX_HOME/config.toml" 2>/dev/null || printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$real" >> "$CODEX_HOME/config.toml"
 (cd "$cwd" && eval "${FAKE_ACTION:-:}")
-printf '{"type":"thread.started","thread_id":"%s"}\n{"type":"turn.started"}\n' "$tid"
-printf '{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"done"}}\n{"type":"turn.completed","usage":{}}\n'
-[ -n "$out" ] && echo "fake report" > "$out"
+started='{"type":"thread.started","thread_id":"'"$tid"'"}'
+msg='{"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"done"}}'
+done_ev='{"type":"turn.completed","usage":{}}'
+case "${FAKE_EVENTS:-}" in
+  no-thread)      printf '%s\n' '{"type":"turn.started"}' "$msg" "$done_ev" ;;
+  two-threads)    printf '%s\n' "$started" "$started" '{"type":"turn.started"}' "$msg" "$done_ev" ;;
+  after-terminal) printf '%s\n' "$started" '{"type":"turn.started"}' "$msg" "$done_ev" \
+                    '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"late"}}' ;;
+  two-terminal)   printf '%s\n' "$started" '{"type":"turn.started"}' "$msg" "$done_ev" "$done_ev" ;;
+  *)              printf '%s\n' "$started" '{"type":"turn.started"}' "$msg" "$done_ev" ;;
+esac
 exit "${FAKE_RC:-0}"
 EOF
 chmod +x "$T/bin/codex"
@@ -57,10 +66,10 @@ newrun() { "$S/new-run.sh" "$@" > "$T/nr.txt" 2>&1 || return 1; RUN=$(sed -n 's/
 # 执行一轮：round <N> [线程ID]；设置 RC、TID
 round() {
   local n=$1; [ -e "$RUN/task-$n.md" ] || echo "task $n" > "$RUN/task-$n.md"
-  PATH="${PRE:-}$PATH" "$S/run.sh" "$RUN" "$n" "$M" "$(sha "$RUN/task-$n.md")" ${2:+"$2"} > "$T/run.txt" 2>&1; RC=$?
+  PATH="${PRE:-}$PATH" "$S/run.sh" "$RUN" "$n" "$M" "$(sha "$RUN/task-$n.md")" "${MODE:-write}" ${2:+"$2"} > "$T/run.txt" 2>&1; RC=$?
   TID=$(sed -n 's/^ROUND=.* THREAD_ID=//p' "$T/run.txt")
 }
-check() { PATH="${PRE:-}$PATH" "$S/check-run.sh" "$RUN" "$1" "$M" "$2" > "$T/check-${3//\//_}.txt" 2>&1; }
+check() { PATH="${PRE:-}$PATH" "$S/check-run.sh" "$RUN" "$1" "$M" "$2" "${CMODE:-${MODE:-write}}" > "$T/check-${3//\//_}.txt" 2>&1; }
 
 scenario() {  # scenario <名称> <期望退出码> <FAKE_ACTION> [额外监视路径...]
   local name=$1 want=$2 action=$3; shift 3
@@ -137,9 +146,9 @@ jq '.branch = "evil"' "$RUN/manifest.json" > "$T/m.tmp" && cat "$T/m.tmp" > "$RU
 check 1 "$t1" "manifest-tamper"; result "manifest 被篡改后 check-run" 3 $?
 
 r=$(mkrepo); newrun "$r"; echo task > "$RUN/task-1.md"
-"$S/run.sh" "$RUN" 1 0000 "$(sha "$RUN/task-1.md")" > /dev/null 2>&1; result "run.sh 传入错误的 manifest 哈希" 3 $?
-"$S/run.sh" "$RUN" 1 "$M" 0000 > /dev/null 2>&1; result "run.sh 任务文件哈希不符" 3 $?
-"$S/run.sh" "$RUN" abc "$M" x > /dev/null 2>&1; result "run.sh 轮次非法" 2 $?
+"$S/run.sh" "$RUN" 1 0000 "$(sha "$RUN/task-1.md")" write > /dev/null 2>&1; result "run.sh 传入错误的 manifest 哈希" 3 $?
+"$S/run.sh" "$RUN" 1 "$M" 0000 write > /dev/null 2>&1; result "run.sh 任务文件哈希不符" 3 $?
+"$S/run.sh" "$RUN" abc "$M" x write > /dev/null 2>&1; result "run.sh 轮次非法" 2 $?
 "$S/run.sh" "$RUN" 1 "$M" > /dev/null 2>&1; result "run.sh 缺少参数" 2 $?
 echo task2 > "$RUN/task-2.md"; round 2 x; result "run.sh 跳过第 1 轮" 2 "$RC"
 FAKE_RC=7 round 1; result "run.sh 传播 Codex 退出码" 7 "$RC"; t1=$TID
@@ -254,6 +263,67 @@ check 1 "$TID" "report-link"; result "报告是符号链接，check-run 判 FAIL
 r=$(mkrepo); newrun "$r"; round 1; t1=$TID
 mv "$RUN/state.json" "$T/outside/state.json"; ln -s "$T/outside/state.json" "$RUN/state.json"
 round 2 "$t1"; result "state.json 被换成符号链接，拒绝" 3 "$RC"
+
+echo "=== 实用加固（第四轮）"
+r=$(mkrepo); echo dirty >> "$r/tracked.txt"; newrun "$r"
+MODE=readonly round 1; MODE=readonly check 1 "$TID" "ro-dirty-clean"; result "只读：已有改动的工作树，无改动" 0 $?
+r=$(mkrepo); echo dirty >> "$r/tracked.txt"; newrun "$r"
+MODE=readonly FAKE_ACTION='echo again >> tracked.txt' round 1; MODE=readonly check 1 "$TID" "ro-dirty-again"
+result "只读：已有改动的文件再次被改（status 不变）" 1 $?
+r=$(mkrepo); echo dirty >> "$r/tracked.txt"; newrun "$r"; MODE=write round 1
+result "写入：基线已有改动时拒绝" 2 "$RC"
+r=$(mkrepo); git -C "$r" update-index --assume-unchanged tracked.txt; newrun "$r"
+MODE=readonly FAKE_ACTION='echo x >> tracked.txt' round 1; MODE=readonly check 1 "$TID" "ro-assume"
+result "只读：已有 assume-unchanged 的文件被改" 1 $?
+r=$(mkrepo); git -C "$r" update-index --skip-worktree tracked.txt; newrun "$r"; MODE=write round 1
+result "写入：基线有 skip-worktree 标记时拒绝" 2 "$RC"
+r=$(mkrepo); git -C "$r" config core.filemode false; newrun "$r"
+MODE=readonly FAKE_ACTION='chmod +x tracked.txt' round 1; MODE=readonly check 1 "$TID" "ro-filemode"
+result "只读：core.filemode=false 时改可执行位" 1 $?
+r=$(mkrepo); newrun "$r"
+MODE=readonly FAKE_ACTION="cp tracked.txt '$T/outside/hl-$RANDOM'; ln -f \"\$(ls -t '$T'/outside/hl-* | head -1)\" tracked.txt" round 1
+MODE=readonly check 1 "$TID" "ro-hardlink"; result "只读：已跟踪文件换成内容相同的硬链接" 1 $?
+r=$(mkrepo); newrun "$r"; MODE=write FAKE_ACTION='echo w >> tracked.txt' round 1; t1=$TID
+MODE=write check 1 "$t1" "w-then-ro-1"; result "写入轮改动已跟踪文件" 0 $?
+MODE=readonly round 2 "$t1"; MODE=readonly check 2 "$t1" "w-then-ro-2"; result "写入轮之后的只读轮（无改动）" 0 $?
+r=$(mkrepo); newrun "$r"; MODE=readonly round 1
+MODE=readonly CMODE=write check 1 "$TID" "mode-mismatch"; result "检查模式与执行模式不同" 1 $?
+
+r=$(mkrepo); printf '*.bin filter=req\n' > "$r/.gitattributes"; git -C "$r" config filter.req.clean cat; git -C "$r" config filter.req.smudge cat
+git -C "$r" config filter.req.required true; echo x > "$r/a.bin"; git -C "$r" add .gitattributes a.bin; git -C "$r" commit -qm req > /dev/null
+before=$(ls -d "$HOME"/.cache/codex-dispatch/run.* 2>/dev/null | wc -l | tr -d ' ')
+"$S/new-run.sh" "$r" > /dev/null 2>&1; result "已跟踪文件使用必需 filter（如 LFS），拒绝" 2 $?
+after=$(ls -d "$HOME"/.cache/codex-dispatch/run.* 2>/dev/null | wc -l | tr -d ' ')
+result "new-run 失败时不留下半成品运行目录" "$before" "$after"
+r=$(mkrepo); git -C "$r" config filter.req.clean cat; git -C "$r" config filter.req.required true
+"$S/new-run.sh" "$r" > /dev/null 2>&1; result "配置了必需 filter 但没有文件使用，允许" 0 $?
+r=$(mkrepo); git -C "$r" config 'http.https://user:tok999@example.com/.extraheader' X; newrun "$r"
+result "config 键名中的凭证被脱敏" absent "$(grep -q tok999 "$RUN/baseline/config.txt" && echo present || echo absent)"
+
+r=$(mkrepo); newrun "$r"; FAKE_EVENTS=no-thread round 1; result "缺少 thread.started，run.sh 返回 6" 6 "$RC"
+r=$(mkrepo); newrun "$r"; FAKE_EVENTS=two-threads round 1; result "两个 thread.started，run.sh 返回 6" 6 "$RC"
+check 1 "$TID" "two-threads"; result "两个 thread.started，check-run 判 FAIL" 1 $?
+r=$(mkrepo); newrun "$r"; FAKE_EVENTS=after-terminal round 1; result "终止事件后还有消息，run.sh 返回 6" 6 "$RC"
+result "报告取终止事件之前的消息" done "$(cat "$RUN/report-1.md")"
+r=$(mkrepo); newrun "$r"; FAKE_EVENTS=two-terminal round 1; result "两个终止事件，run.sh 返回 6" 6 "$RC"
+
+r=$(mkrepo); newrun "$r"
+FAKE_ACTION='mkdir -p "$CODEX_HOME/sessions/0000"; cp "$sdir/rollout-x-$tid.jsonl" "$CODEX_HOME/sessions/0000/aaa-$tid.jsonl"' round 1
+check 1 "$TID" "dup-session"; result "同一线程有两个 session 文件" 1 $?
+r=$(mkrepo); newrun "$r"; round 1; sf=$(jq -r .session_path "$RUN/state.json"); echo '{bad' >> "$sf"
+check 1 "$TID" "bad-session"; result "session 尾部有非法 JSON" 1 $?
+r=$(mkrepo); newrun "$r"; round 1; sf=$(jq -r .session_path "$RUN/state.json"); cp "$sf" "$sf.real"; rm "$sf"; ln -s "$sf.real" "$sf"
+check 1 "$TID" "link-session"; result "session 文件被换成符号链接" 1 $?
+r=$(mkrepo); newrun "$r"; FAKE_META_ID=00000000-0000-0000-0000-000000000000 round 1
+check 1 "$TID" "meta-session"; result "session 内部线程 ID 不符" 1 $?
+
+r=$(mkrepo); real=$(cd "$r" && pwd -P); newrun "$r"
+lk="$HOME/.cache/codex-dispatch/locks/$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_dev}-{s.st_ino}")' "$real").lock"
+mkdir -p "$lk"; round 1; result "仓库被另一个任务占用，拒绝" 5 "$RC"; rm -rf "$lk"
+
+r=$(mkrepo); real=$(cd "$r" && pwd -P); printf '\n[projects."%s"]\ntrust_level = "trusted"\n' "$real" >> "$CODEX_HOME/config.toml"; newrun "$r"
+FAKE_ACTION="python3 -c 'import sys; p=sys.argv[1]; e=\"\\n[projects.\\\"%s\\\"]\\ntrust_level = \\\"trusted\\\"\\n\" % sys.argv[2]; s=open(p).read(); open(p,\"w\").write(s.replace(e,\"\"))' \"\$CODEX_HOME/config.toml\" '$real'" round 1
+check 1 "$TID" "trust-removed"; result "基线已信任本仓库，之后条目被删除" 1 $?
 
 echo "=== 工具链替换（放在最后，会改动假 codex）"
 r=$(mkrepo); newrun "$r"; round 1; t1=$TID

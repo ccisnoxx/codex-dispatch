@@ -25,6 +25,15 @@ git_dir=$(real_dir "$(g rev-parse --absolute-git-dir)")
 common_dir=$(real_dir "$(g rev-parse --path-format=absolute --git-common-dir)")
 index_file=$(g rev-parse --path-format=absolute --git-path index)
 index_path="$(real_dir "${index_file%/*}")/${index_file##*/}"
+# 已跟踪文件使用必需 filter（如 Git LFS）的仓库不支持，退出 2
+snaplib check-filters "$root"
+# 写入模式要求基线时已跟踪文件没有改动、没有 assume-unchanged/skip-worktree 标记，否则 Codex 的改动无法与已有改动区分
+write_blockers=$(
+  g status --porcelain=v1 --untracked-files=no --ignore-submodules=none | while IFS= read -r l; do printf '已有改动：%s\n' "$l"; done
+  g ls-files -v | while IFS= read -r l; do
+    case "${l:0:1}" in [a-z]|S) printf '带 assume-unchanged/skip-worktree 标记：%s\n' "${l:2}" ;; esac
+  done
+)
 
 # 监视路径由 snaplib 生成：Codex 配置、所有生效的 Git 配置文件及其 include 目标、全局 ignore/attributes、
 # 外部 hooksPath、用户指定路径；含换行或范围过大时退出 2
@@ -33,6 +42,9 @@ watched=$(snaplib watch-list "$root" "$git_dir" "$common_dir" "$(codex_home)/con
 
 mkdir -p "$HOME/.cache/codex-dispatch"
 run=$(real_dir "$(snaplib mkdtemp "$HOME/.cache/codex-dispatch" run.)")
+# 失败时删除本次创建的运行目录，不留下半成品
+completed=0
+trap '[ "$completed" = 1 ] || { [ -n "$run" ] && [ -d "$run" ] && rm -rf -- "$run"; }' EXIT
 
 # 先写草稿 manifest 供快照读取监视路径，基线完成后把基线文件哈希写进最终 manifest
 draft="$run/.manifest-draft.json"
@@ -43,18 +55,25 @@ jq -n --arg repo "$root" --arg git_dir "$git_dir" --arg common_dir "$common_dir"
       --argjson watched "$watched" --arg index_path "$index_path" --argjson profile "$EXPECTED_PERMISSION_PROFILE" \
       --arg run_dir "$run" --arg run_identity "$(snaplib identity "$run")" \
       --argjson tools "$(snaplib tools "${TOOLS[@]}")" \
+      --arg write_blockers "$write_blockers" \
       '{repo: $repo, git_dir: $git_dir, common_dir: $common_dir, index_path: $index_path, branch: $branch, head: $head,
         run_dir: $run_dir, run_identity: $run_identity, codex_version: $codex_version, created_at: $created,
         expected: {cwd: $repo, sandbox: $sandbox, approval: $approval, permission_profile: $profile},
+        write_allowed: ($write_blockers == ""), write_blockers: ($write_blockers | split("\n") | map(select(length > 0))),
         tools: $tools, watched: $watched}' > "$draft"
 mkdir "$run/baseline"
 "$here/snapshot.sh" "$root" "$run/baseline" "$draft"
 jq --argjson digests "$(snaplib digests "$run/baseline")" '. + {baseline_sha256: $digests}' "$draft" > "$run/manifest.json"
 rm "$draft"
-jq -n '{thread_id: null, last_round: 0}' > "$run/state.json"
+jq -n '{thread_id: null, last_round: 0, rounds: {}}' > "$run/state.json"
+completed=1
 
 echo "RUN_DIR=$run"
 jq 'del(.baseline_sha256, .tools)' "$run/manifest.json"
+if [ -n "$write_blockers" ]; then
+  echo "--- 注意：本运行目录只能用于只读调查（readonly），写入模式会被拒绝："
+  printf '%s\n' "$write_blockers"
+fi
 echo "--- baseline status"
 cat "$run/baseline/status.txt"
 echo "--- 被忽略的文件（内容不在审计范围内；关键文件请作为额外监视路径重新建运行目录）"
