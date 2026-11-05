@@ -25,23 +25,33 @@ Claude 主会话负责任务设计、方向决策和验收，Codex 在边界内�
 | 脚本 | 用途 |
 | --- | --- |
 | `new-run.sh <仓库> [额外监视路径...]` | 检查依赖和 Codex 版本，建运行目录（权限 700），写入不可变的 `manifest.json` 和可变的 `state.json`，保存基线，输出 `MANIFEST_SHA` 和全部哈希 |
-| `run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> [THREAD_ID]` | 执行第 N 轮：先校验 manifest 和任务文件哈希、线程 ID（N>1 必填）、轮次连续性、本轮输出路径均不存在、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
-| `check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>` | 机械检查：Codex 退出码、事件、线程 ID、逐条断言实际权限、Git 状态和监视文件对比；快照写入随机命名的新目录 |
+| `run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <readonly\|write> [THREAD_ID]` | 执行第 N 轮：先校验 manifest 和任务文件哈希、模式、仓库级锁、线程 ID（N>1 必填）、轮次连续性、本轮输出路径均不存在、仓库/分支/HEAD 和 Git 元数据；N=1 新建线程，N>1 续跑同一线程；退出码与 Codex 一致 |
+| `check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID> <readonly\|write>` | 机械检查：Codex 退出码、按协议严格校验事件序列、线程 ID、逐条断言实际权限、Git 状态和监视文件对比；快照写入随机命名的新目录 |
 | `snapshot.sh`、`common.sh`、`snaplib.py` | 快照、公共函数和 Python 辅助（快照、对比、监视清单、写报告），由上面三个脚本调用 |
 
 `tests/regression.sh` 用假的 `codex` 在隔离环境里验证上述检测能力，不调用真实模型。修改脚本或升级 Codex 后先跑它。
 
 **`check-run.sh` 的覆盖范围：** HEAD、分支、index（含 assume-unchanged 等标记）、refs、stash、remotes、本地 config、worktrees、submodules、对象库计数；Git 管理目录中除对象库外的全部文件和目录（含权限；reflog、hooks、`info/exclude`、`FETCH_HEAD` 等）；派单前已有的未跟踪文件内容；监视路径（Codex 配置、生效中的仓库外 Git 配置文件、全局 ignore/attributes、外部 hooksPath，以及额外指定的路径）。符号链接同时记录链接本身、解析后的目标和目标内容；指向目录的符号链接会递归记录目标目录，按设备号和 inode 检测循环，不跨文件系统下降；不存在、FIFO、socket 等类型分别记录。派单前已有的未跟踪目录（如嵌套仓库）递归记录内容，其中的 `.git/objects` 除外；这些目录中出现新内容同样判 FAIL。每个已初始化 submodule 的 HEAD、分支、工作树 status 和 diff 哈希逐个记录，不受 `submodule.*.ignore` 影响。监视清单包含所有生效的 Git 配置文件，以及 `include.path`、`includeIf.*.path` 指向的文件（即使为空或不存在）。Git 管理目录只跳过真正的对象库（Git 目录直属的 `objects`、`modules/` 下子仓库的 `objects`、`lfs/objects`）。remote 只记录名称、类型、主机名和 URL 哈希，config 只记录键名和值的哈希，避免凭证进入快照。
 
-以下情况会**拒绝建立基线或判为 FAIL**（fail closed），而不是跳过：submodule 状态无法采集；监视路径含换行符；监视路径是 `/`、主目录，或仓库本身及其上级目录；单次扫描超过 20 万个条目或 4 GiB。
+以下情况会**拒绝建立基线或判为 FAIL**（fail closed），而不是跳过：已跟踪文件使用了必需的 Git filter（如 Git LFS，本工具不支持）；submodule 状态无法采集；监视路径含换行符；监视路径是 `/`、主目录，或仓库本身及其上级目录；单次扫描超过 20 万个条目或 4 GiB。
 
 运行目录的物理路径和身份（设备号、inode、所有者、权限位）、基线文件哈希、工具链（`codex`、`git`、`jq`、`python3`、`shasum`、`bash`）的实际路径和文件哈希都写入 manifest，`run.sh` 和 `check-run.sh` 每次自动复核。决定 PASS/FAIL 的比对全部在 `snaplib.py` 中完成，判定路径上只使用 bash 内建命令和上述登记过的工具，不依赖 `cmp`、`diff`、`grep` 等未登记命令。
 
-报告不再由 `codex exec -o` 写入，而是由 `run.sh` 从 JSONL 中提取最后一条消息，以独占、不跟随符号链接的方式创建；`check-run.sh` 要求 events、报告、退出码和 stderr 都是普通文件。
+**两种模式：** 每轮以 `readonly` 或 `write` 运行，`check-run.sh` 必须使用同一模式。已跟踪文件直接按文件系统记录内容、权限、所有者和硬链接数，不受 assume-unchanged、skip-worktree、`core.filemode` 影响。
+- `readonly`：已跟踪文件、工作树 diff、status 和未跟踪内容都必须与本轮开始前一致，可以在已有改动的工作树上使用。
+- `write`：要求建立基线时已跟踪文件没有任何改动，也没有 assume-unchanged/skip-worktree 标记，否则 `run.sh` 拒绝（`new-run.sh` 会提前提示）。本轮改动的已跟踪文件逐个列出，供 Claude 判断范围。
 
-**PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。工具链复核使用的是同一套工具，只能发现替换痕迹，不能抵御已被替换的工具伪造结果。
+**事件与报告：** 事件序列按协议严格校验（唯一的 `thread.started` 开头、唯一的 `turn.started`、唯一的终止事件且位于末尾、为 `turn.completed`、之前有非空的最终消息、无顶层 `error`）。报告取校验器认可的最终消息，以独占、不跟随符号链接的方式创建；`check-run.sh` 要求报告与该消息一致，且 events、报告、退出码和 stderr 都是普通文件。session 文件按 `-<线程ID>.jsonl` 精确匹配，必须恰好一个、是普通文件、第一行是本线程的 `session_meta`、每行都是合法 JSON；首次找到后路径记入 `state.json`，后续不再遍历全部会话。
 
-Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[projects."<目录>"] trust_level = "trusted"`。所以这份配置按 TOML 解析后做规范化比较：本仓库条目恰好只有 `trust_level = "trusted"` 时才排除，其他任何配置改动仍判为 FAIL；纯注释改动不计入。配置是符号链接时，链接目标的变化也会被检出。配置无法解析时，退回到逐字节比较。
+**锁：** 同一仓库同一时间只允许一个 `run.sh` 或 `check-run.sh` 运行（`~/.cache/codex-dispatch/locks/` 下的仓库级锁）。
+
+**`state.json`** 按轮次记录模式、状态、退出码和任务哈希，在本轮事件校验、报告和 session 定位都完成后才写入。
+
+**PASS 不代表**被忽略文件的内容、未登记的外部文件、对象库内容（只比对数量）或外部副作用没有变化。
+
+**不在威胁模型内的情况：** 本工具防的是 Codex 的失误和越界操作，不防一个刻意对抗审计的 Codex。以下情况在同一用户、完全访问权限下无法靠事后检查解决，需要隔离环境（独立用户、容器或虚拟机）：运行结束后伪造或改写证据文件（events、报告、state）；替换 `mkdir`、`rm` 等未登记命令或已登记工具本身；改动 Git 环境变量（如 `GIT_CONFIG_GLOBAL`、`GIT_DIR`）；对象库元数据与内容；index 文件中条目之外的扩展字段；运行结束后仍在后台继续的进程。
+
+Codex 每次在新目录运行，都会往 `~/.codex/config.toml` 写入 `[projects."<目录>"] trust_level = "trusted"`。所以这份配置按 TOML 解析后做规范化比较，本仓库条目单独记录状态：只放过“不存在 → 恰好只有 `trust_level = "trusted"`”这一个方向，删除已有条目或改为其他值都判 FAIL；其他任何配置改动也判 FAIL；纯注释改动不计入。配置是符号链接时，链接目标的变化也会被检出。配置无法解析时，退回到逐字节比较。
 
 ## 1. 派单前（按顺序）
 
@@ -142,13 +152,15 @@ shasum -a 256 ~/.claude/skills/codex-dispatch/scripts/*.sh ~/.claude/skills/code
 ```
 
 ```bash
-scripts/run.sh <运行目录> 1 <MANIFEST_SHA> <TASK_SHA>
-scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <THREAD_ID>   # N>1
+scripts/run.sh <运行目录> 1 <MANIFEST_SHA> <TASK_SHA> <readonly|write>
+scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <readonly|write> <THREAD_ID>   # N>1
 ```
+
+模式与任务的执行模式对应：只读调查用 `readonly`，有限实施用 `write`。
 
 - **只读调查**可以前台运行。**有限实施**一律用 Bash 的 `run_in_background`，避免前台 10 分钟超时把 Codex 中断在写到一半的状态。
 - 进程是否结束，以 Claude Code 后台任务的结束通知为准；`pgrep` 只作辅助诊断。结束不代表成功。
-- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本、轮次不符，或本轮输出路径已存在）、3（运行目录被替换或不是物理路径，或 manifest、基线、任务文件、线程 ID 与会话记录不符）、4（运行前检查发现仓库、分支、HEAD、Git 元数据或工具链已变）、5（运行目录被占用，存在 `.lock`）。拒绝时不要绕过，按第 4 节的越界规则处理；`.lock` 只有在确认没有其他进程使用时才能手动删除。
+- 退出码：与 Codex 相同；脚本拒绝执行时为 2（参数、版本、轮次不符，或本轮输出路径已存在）、3（运行目录被替换或不是物理路径，或 manifest、基线、任务文件、线程 ID 与会话记录不符）、4（运行前检查发现仓库、分支、HEAD、Git 元数据或工具链已变）、5（运行目录或仓库被占用）、6（Codex 退出码为 0，但事件序列未通过校验）。拒绝时不要绕过，按第 4 节的越界规则处理；锁目录只有在确认对应进程已结束后才能手动删除。
 - 首轮结束后，线程 ID 写进 `state.json` 并输出出来。把它记在会话里，后续轮次和 `check-run.sh` 都以参数形式传入会话里的值，脚本会与 `state.json` 和 events 比对。`manifest.json` 创建后不再改动。
 - 脚本不传沙箱参数，`resume` 也一样。`resume` 子命令本身不定义 `-C`，脚本用子 shell `cd` 进入仓库。
 
@@ -156,15 +168,15 @@ scripts/run.sh <运行目录> <N> <MANIFEST_SHA> <TASK_SHA> <THREAD_ID>   # N>1
 
 **退出码和 Codex 的报告都不能作为通过依据。**
 
-1. **机械检查。** 先按第 3 节复核脚本哈希，再运行 `scripts/check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID>`，结果为 FAIL 就不算通过。它检查以下内容：
+1. **机械检查。** 先按第 3 节复核脚本哈希，再运行 `scripts/check-run.sh <运行目录> <N> <MANIFEST_SHA> <THREAD_ID> <readonly|write>`，结果为 FAIL 就不算通过。它检查以下内容：
    - manifest 哈希与会话记录一致（不一致时直接退出 3）；
-   - Codex 退出码为 0；JSONL 可解析，`state.json` 和 events 中的线程 ID 都与会话记录一致，最后终止事件为 `turn.completed`，没有 `turn.failed` 和顶层 `error`，报告非空；
+   - 模式与执行时一致，`run.sh` 记录本轮状态为 completed；Codex 退出码为 0；事件序列按协议严格校验通过，`state.json` 和 events 中的线程 ID 都与会话记录一致，报告与最终消息一致；
    - 每条 `turn_context` 的 `cwd`、`sandbox_policy`、`approval_policy`、`permission_profile` 都与 manifest 中的期望值一致；
-   - 开头“覆盖范围”所列的仓库状态和监视路径都与基线一致。
+   - 开头“覆盖范围”所列的仓库状态和监视路径都与基线一致；`readonly` 下工作树与本轮开始前一致。
    输出 `WARN: index 文件字节变化但条目一致` 时，通常是有人运行了普通的 `git status`，不算越界；但如果用户的 IDE 等工具同时在操作这个仓库，任何 FAIL 都要先排除它们的影响再下结论。
 2. **核对哈希。** 基线文件已由脚本对照 manifest 自动校验。把输出的任务文件 sha256 与启动前回显的值逐个对比，变了就判定证据被篡改。线程 ID 以会话里记录的值为准。
 3. **逐条判断条目级 error。** 不按字符串自动忽略。Codex 0.166.0 下，`item.type == "error"` 且内容为 “Under-development features enabled: …” 的条目是已知的配置警告（本机已设置 `suppress_unstable_features_warning = true`，正常情况下不应再出现）；其他内容都要看是否影响本次任务。
-4. **判断改动范围。** 读 `git diff`、新增的未跟踪文件和 status 差异，确认都在允许范围内。
+4. **判断改动范围。** 读 `check-run.sh` 列出的已跟踪文件改动、`git diff`、新增的未跟踪文件和 status 差异，确认都在允许范围内。
 5. **核对仓库外操作。** Codex 报告了仓库外改动或联网操作的，逐项核实影响；events 里的命令记录显示有、报告却没写的，按越界处理。
 6. **读实现和测试。** 需要证明测试确实覆盖了目标行为时，用 `git -C <仓库> archive <基线HEAD> | tar -x -C <临时目录>` 导出一份基线副本，只把新测试放进去跑，应该失败；在新实现上跑，应该通过。不要在实施工作树里做 checkout 或还原，也不要用 `git worktree add`，它会改动 Git 元数据。
 7. **亲自复跑关键验证。** 尽量不留构建产物（例如 Python 用 `PYTHONDONTWRITEBYTECODE=1`，注意 `-I` 会让它失效）。跑完再看一次 `git status`，清掉自己产生的产物。

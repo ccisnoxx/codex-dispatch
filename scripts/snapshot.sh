@@ -41,6 +41,9 @@ admin_dirs=("$git_dir")
 [ "$common_dir" = "$git_dir" ] || admin_dirs+=("$common_dir")
 snaplib gitadmin "$(jq -r .index_path "$manifest")" "${admin_dirs[@]}" > "$out/gitadmin.txt"
 
+# 已跟踪文件直接读文件系统记录内容、权限、所有者和硬链接数，不受 assume-unchanged、skip-worktree、core.filemode 影响
+snaplib tracked "$repo" > "$out/tracked-worktree.txt"
+
 # 派单前已有的未跟踪（未忽略）文件；嵌套仓库等目录条目递归记录内容
 g ls-files -o --exclude-standard -z | snaplib untracked "$repo" > "$out/untracked.txt"
 

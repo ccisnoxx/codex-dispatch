@@ -10,8 +10,10 @@
 import difflib
 import hashlib
 import io
+import itertools
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -26,7 +28,7 @@ MAX_BYTES = int(os.environ.get("CODEX_DISPATCH_MAX_BYTES", 4 * 1024**3))
 # 与基线逐行比对、有变化即 FAIL 的快照文件
 STRICT_FILES = ["head.txt", "index.patch", "index-entries.txt", "refs.txt", "stash.txt", "remotes.txt",
                 "config.txt", "worktrees.txt", "submodules.txt", "submodule-worktrees.txt",
-                "count-objects.txt", "watched.txt"]
+                "count-objects.txt"]
 
 
 def q(s):
@@ -172,21 +174,31 @@ def nested_repo_pruner(child):
 # ---------- 快照子命令 ----------
 
 def normalized_codex_config(path, repo):
+    """返回（去掉本仓库 projects 条目后的配置摘要，本仓库条目状态）。
+    条目状态为 absent、trusted（恰好只有 trust_level = "trusted"）或 other:<摘要>。"""
     with open(path, "rb") as fh:
         data = tomllib.load(fh)
+    entry = None
     projects = data.get("projects")
     if isinstance(projects, dict):
         for key in {repo, repo.removeprefix("/private")}:
-            if projects.get(key) == {"trust_level": "trusted"}:
-                del projects[key]
+            if key in projects:
+                entry = projects.pop(key)
         if not projects:
             del data["projects"]
-    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+    if entry is None:
+        state = "absent"
+    elif entry == {"trust_level": "trusted"}:
+        state = "trusted"
+    else:
+        state = "other:" + hashlib.sha256(json.dumps(entry, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    digest = hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()
+    return digest, state
 
 
 def codex_config_line(w, path, repo):
-    """Codex 配置：记录链接身份和规范化内容，不复制配置文本。
-    本仓库条目恰好只有 trust_level = "trusted" 时不计入（Codex 首次进入目录时自动写入）。"""
+    """Codex 配置：记录链接身份、去掉本仓库条目后的规范化摘要和本仓库条目状态，不复制配置文本。
+    Codex 首次进入目录时会写入 trust_level = "trusted"，比对时只放过 absent -> trusted 这一个方向。"""
     try:
         st = os.lstat(path)
     except FileNotFoundError:
@@ -194,10 +206,11 @@ def codex_config_line(w, path, repo):
         return
     ident = ["link", q(os.readlink(path)), q(os.path.realpath(path))] if stat.S_ISLNK(st.st_mode) else ["file"]
     try:
-        digest = "toml:" + normalized_codex_config(path, repo)
+        digest, state = normalized_codex_config(path, repo)
+        digest = "toml:" + digest
     except (OSError, tomllib.TOMLDecodeError):
-        digest = "raw:" + (w.file_digest(path) or "(not-regular)")
-    w.emit("C", format(stat.S_IMODE(st.st_mode), "o"), *ident, digest, q(path))
+        digest, state = "raw:" + (w.file_digest(path) or "(not-regular)"), "unparsed"
+    w.emit("C", format(stat.S_IMODE(st.st_mode), "o"), *ident, digest, "repo_entry=" + state, q(path))
 
 
 def cmd_watched(manifest, repo, codex_cfg):
@@ -255,11 +268,16 @@ def cmd_remotes():
 
 
 def cmd_config():
-    """输入为 git config --list -z：每条记录为 key 或 key\\nvalue。只输出键名和完整值的哈希。"""
+    """输入为 git config --list -z：每条记录为 key 或 key\\nvalue。只输出脱敏后的键名和完整值的哈希。"""
     for rec in sys.stdin.buffer.read().split(b"\0"):
         if rec:
             key, _, value = rec.partition(b"\n")
-            print(os.fsdecode(key), hashlib.sha256(value).hexdigest()[:16])
+            name = os.fsdecode(key)
+            section, _, rest = name.partition(".")
+            if "." in rest:      # section.subsection.variable：子节可能是含凭证的 URL，只记录哈希
+                sub, _, var = rest.rpartition(".")
+                name = f"{section}.<{hashlib.sha256(sub.encode()).hexdigest()[:12]}>.{var}"
+            print(name, hashlib.sha256(value).hexdigest()[:16])
 
 
 def cmd_submodules(repo):
@@ -279,6 +297,53 @@ def cmd_submodules(repo):
               "diff:" + hashlib.sha256(patch).hexdigest()[:16])
         for line in status.decode(errors="replace").splitlines():
             print("  ", q(name), line)
+
+
+def cmd_tracked(repo):
+    """直接读文件系统记录每个已跟踪路径的类型、权限、所有者、硬链接数和内容，
+    不受 assume-unchanged、skip-worktree、core.filemode 影响。submodule（gitlink）由 submodules 单独记录。"""
+    r = git(repo, "ls-files", "-s", "-z")
+    w = Walker(sys.stdout, lambda child: False)
+    for rec in r.stdout.split(b"\0"):
+        if not rec:
+            continue
+        meta, _, rel = rec.partition(b"\t")
+        if meta.startswith(b"160000"):
+            continue
+        name = os.fsdecode(rel)
+        path = os.path.join(repo, name)
+        try:
+            st = os.lstat(path)
+        except FileNotFoundError:
+            w.emit("MISSING", q(name))
+            continue
+        w.charge()
+        info = [format(stat.S_IMODE(st.st_mode), "o"), str(st.st_uid), str(st.st_gid), "nlink=" + str(st.st_nlink)]
+        if stat.S_ISLNK(st.st_mode):
+            w.emit("L", *info, "->", q(os.readlink(path)), q(name))
+        elif stat.S_ISREG(st.st_mode):
+            w.emit("F", *info, str(st.st_size), w.file_digest(path) or "(changed-type)", q(name))
+        else:
+            w.emit("OTHER", *info, q(name))
+
+
+def cmd_check_filters(repo):
+    """仓库中被已跟踪文件使用的必需 filter（如 Git LFS）会让关闭 filter 后的 git 命令失败，明确拒绝。"""
+    r = git(repo, "config", "--name-only", "--get-regexp", r"^filter\..*\.required$", check=False)
+    required = set()
+    for key in os.fsdecode(r.stdout).splitlines():
+        if git(repo, "config", "--type=bool", "--get", key, check=False).stdout.strip() == b"true":
+            required.add(key[len("filter."):-len(".required")])
+    if not required:
+        return
+    files = git(repo, "ls-files", "-z").stdout
+    env = dict(os.environ, GIT_OPTIONAL_LOCKS="0")
+    attrs = subprocess.run(["git", "-C", repo, "check-attr", "--stdin", "-z", "filter"],
+                           input=files, capture_output=True, env=env).stdout.split(b"\0")
+    hits = [os.fsdecode(attrs[i]) for i in range(0, len(attrs) - 2, 3) if os.fsdecode(attrs[i + 2]) in required]
+    if hits:
+        fail("仓库中的已跟踪文件使用了必需的 Git filter（如 Git LFS），本工具不支持："
+             + ", ".join(hits[:5]) + (" 等" if len(hits) > 5 else ""), 2)
 
 
 # ---------- 监视清单 ----------
@@ -363,29 +428,55 @@ def read_lines(path):
 
 
 def show_diff(a, b, limit=20):
-    for line in list(difflib.unified_diff(a, b, "baseline", "current", lineterm="", n=0))[2:2 + limit]:
+    for line in itertools.islice(difflib.unified_diff(a, b, "baseline", "current", lineterm="", n=0), 2, 2 + limit):
         print("  " + line)
 
 
-def cmd_compare(base, cur):
-    """对比两份快照。有任一 FAIL 时退出码为 1；工作树改动只展示，由 Claude 判断是否在范围内。"""
+def trust_tolerant(base_lines, cur_lines):
+    """Codex 配置行中，本仓库条目只允许从 absent 变为 trusted：把这种变化视为未变，其他变化保留。"""
+    base_by_label = {label_of(l): l for l in base_lines if l.startswith("C ")}
+    out = []
+    for l in cur_lines:
+        b = base_by_label.get(label_of(l)) if l.startswith("C ") else None
+        if b and " repo_entry=trusted " in l and " repo_entry=absent " in b \
+                and l.replace(" repo_entry=trusted ", " repo_entry=absent ") == b:
+            l = b
+        out.append(l)
+    return out
+
+
+def cmd_compare(base, cur, mode="write", pre=""):
+    """对比两份快照。mode=readonly 时，已跟踪文件、工作树 diff、status 和未跟踪内容必须与本轮开始前（pre）一致；
+    mode=write 时这些改动只展示，由 Claude 判断是否在范围内。有任一 FAIL 时退出码为 1。"""
     failed = False
+    pre = pre or base
 
     def bad(msg):
         nonlocal failed
         failed = True
         print("FAIL: " + msg)
 
+    def lines(d, name):
+        return read_lines(os.path.join(d, name))
+
     for name in STRICT_FILES:
-        a, b = read_lines(os.path.join(base, name)), read_lines(os.path.join(cur, name))
+        a, b = lines(base, name), lines(cur, name)
         if a == b:
             print(f"ok:   {name} 未变")
         else:
             bad(f"{name} 有变化")
             show_diff(a, b)
 
+    wa, wb = lines(base, "watched.txt"), lines(cur, "watched.txt")
+    wb2 = trust_tolerant(wa, wb)
+    if wa == wb2:
+        print("ok:   watched.txt 未变" + ("（Codex 自动信任了本仓库）" if wb2 != wb else ""))
+    else:
+        bad("watched.txt 有变化")
+        show_diff(wa, wb2)
+
     # 只放过实际 index 文件（IDX）的字节变化：条目不变时通常是普通 git status 刷新了 stat 缓存
-    ga, gb = read_lines(os.path.join(base, "gitadmin.txt")), read_lines(os.path.join(cur, "gitadmin.txt"))
+    ga, gb = lines(base, "gitadmin.txt"), lines(cur, "gitadmin.txt")
     na, nb = [l for l in ga if not l.startswith("IDX ")], [l for l in gb if not l.startswith("IDX ")]
     if na == nb:
         print("ok:   Git 管理目录未变")
@@ -393,10 +484,10 @@ def cmd_compare(base, cur):
         bad("Git 管理目录有变化")
         show_diff(na, nb, 30)
     if [l for l in ga if l.startswith("IDX ")] != [l for l in gb if l.startswith("IDX ")]:
-        if read_lines(os.path.join(base, "index-entries.txt")) == read_lines(os.path.join(cur, "index-entries.txt")):
+        if lines(base, "index-entries.txt") == lines(cur, "index-entries.txt"):
             print("WARN: index 文件字节变化但条目一致，可能是 git status 刷新了 stat 缓存")
 
-    ua, ub = read_lines(os.path.join(base, "untracked.txt")), read_lines(os.path.join(cur, "untracked.txt"))
+    ua, ub = lines(base, "untracked.txt"), lines(cur, "untracked.txt")
     sa, sb = set(ua), set(ub)
     gone = [l for l in ua if l not in sb]
     if gone:
@@ -407,24 +498,47 @@ def cmd_compare(base, cur):
         print("ok:   派单前的未跟踪文件均未改动")
     # 派单前已有的未跟踪目录（含嵌套仓库）里出现的新内容同样不在任务范围内
     old_dirs = [label_of(l) + "/" for l in ua if l.startswith("D ")]
-    added = [l for l in ub if l not in sa]
-    inside = [l for l in added if any((label_of(l) or "").startswith(d) for d in old_dirs)]
+    inside = [l for l in ub if l not in sa and any((label_of(l) or "").startswith(d) for d in old_dirs)]
     if inside:
         bad("派单前已有的未跟踪目录中出现新内容：")
         for l in inside[:20]:
             print("  " + l)
-    others = [l for l in added if l not in inside]
-    if others:
-        print("INFO: 新增的未跟踪内容（判断是否在范围内）：")
-        for l in others[:20]:
-            print("  " + l)
 
-    ia, ib = read_lines(os.path.join(base, "ignored.txt")), read_lines(os.path.join(cur, "ignored.txt"))
+    # 已跟踪文件直接按文件系统比对，不依赖 git status
+    ta, tb = lines(pre, "tracked-worktree.txt"), lines(cur, "tracked-worktree.txt")
+    changed = sorted({label_of(l) for l in set(ta) ^ set(tb)} - {None})
+    pa, pb = lines(pre, "untracked.txt"), lines(cur, "untracked.txt")
+    new_untracked = [l for l in pb if l not in set(pa) and l not in inside]
+    if mode == "readonly":
+        if changed:
+            bad("只读模式下已跟踪文件有变化（内容、权限、所有者或硬链接）：")
+            for name in changed[:20]:
+                print("  " + q(name))
+        else:
+            print("ok:   只读模式下已跟踪文件未变")
+        for name in ("worktree.patch", "status.txt"):
+            if lines(pre, name) != lines(cur, name):
+                bad(f"只读模式下 {name} 有变化")
+        if new_untracked or [l for l in pa if l not in set(pb)]:
+            bad("只读模式下未跟踪内容有变化")
+            for l in (new_untracked or pb)[:20]:
+                print("  " + l)
+    else:
+        if changed:
+            print("INFO: 本轮改动的已跟踪文件（直接读文件系统，判断是否在范围内）：")
+            for name in changed[:50]:
+                print("  " + q(name))
+        if new_untracked:
+            print("INFO: 新增的未跟踪内容（判断是否在范围内）：")
+            for l in new_untracked[:20]:
+                print("  " + l)
+
+    ia, ib = lines(base, "ignored.txt"), lines(cur, "ignored.txt")
     if ia != ib:
         print("INFO: 被忽略文件清单有变化（内容不在审计范围内）：")
         show_diff(ia, ib)
     print("--- 工作树 status 差异（判断是否在范围内）")
-    show_diff(read_lines(os.path.join(base, "status.txt")), read_lines(os.path.join(cur, "status.txt")), 50)
+    show_diff(lines(pre, "status.txt"), lines(cur, "status.txt"), 50)
     sys.exit(1 if failed else 0)
 
 
@@ -471,35 +585,126 @@ def cmd_regular(*paths):
     sys.exit(1 if bad else 0)
 
 
-def cmd_write_report(events, report):
-    """从 JSONL 中提取最后一条 agent_message 写成报告；目标已存在（含符号链接）时失败，不跟随链接。"""
-    text = ""
-    with open(events, encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            item = ev.get("item") or {}
-            if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
-                text = item.get("text") or ""
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def validate_events(events, expected_thread=""):
+    """按 Codex exec --json 协议严格校验一轮事件，返回 (错误列表, 线程 ID, 最终消息)。"""
+    errors, evs = [], []
+    try:
+        with open(events, encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                if line.strip():
+                    try:
+                        evs.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        errors.append(f"第 {i} 行不是合法 JSON")
+    except OSError as e:
+        return [f"无法读取事件文件：{e}"], "", ""
+    types = [e.get("type") for e in evs]
+    starts = [e for e in evs if e.get("type") == "thread.started"]
+    tid = starts[0].get("thread_id", "") if starts else ""
+    if len(starts) != 1 or not types or types[0] != "thread.started":
+        errors.append(f"必须以唯一的 thread.started 开头（实际 {len(starts)} 个）")
+    if tid and not UUID_RE.match(tid):
+        errors.append(f"线程 ID 格式不对：{tid}")
+    if expected_thread and tid != expected_thread:
+        errors.append(f"线程 ID={tid}，期望 {expected_thread}")
+    if types.count("turn.started") != 1:
+        errors.append(f"turn.started 应恰好 1 个（实际 {types.count('turn.started')} 个）")
+    terminals = [i for i, t in enumerate(types) if t in ("turn.completed", "turn.failed")]
+    if len(terminals) != 1:
+        errors.append(f"终止事件应恰好 1 个（实际 {len(terminals)} 个）")
+    elif terminals[0] != len(evs) - 1:
+        errors.append("终止事件之后还有其他事件")
+    elif types[-1] != "turn.completed":
+        errors.append("最后终止事件为 turn.failed")
+    if "error" in types:
+        errors.append("存在顶层 error 事件")
+    end = terminals[0] if terminals else len(evs)
+    msgs = [e["item"].get("text") or "" for e in evs[:end]
+            if e.get("type") == "item.completed" and (e.get("item") or {}).get("type") == "agent_message"]
+    final = msgs[-1] if msgs else ""
+    if not final.strip():
+        errors.append("终止事件之前没有非空的 agent_message")
+    return errors, tid, final
+
+
+def cmd_validate_events(events, expected_thread=""):
+    errors, tid, final = validate_events(events, expected_thread)
+    print(json.dumps({"ok": not errors, "errors": errors, "thread_id": tid, "final_message": final},
+                     ensure_ascii=False))
+
+
+def cmd_write_report(events, report, expected_thread=""):
+    """报告取自事件校验器认可的最终消息（终止事件之前最后一条 agent_message）；
+    目标已存在（含符号链接）时失败，不跟随链接。"""
+    _, _, final = validate_events(events, expected_thread)
     try:
         fd = os.open(report, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     except OSError as e:
         fail(f"无法创建报告（已存在或是符号链接）：{report}：{e}", 3)
     with os.fdopen(fd, "wb") as fh:
-        fh.write(text.encode())
+        fh.write(final.encode())
 
 
-def cmd_state_update(state, thread_id, round_no):
+def find_session(codex_home, thread_id):
+    """按文件名后缀 -<线程ID>.jsonl 精确查找；必须恰好一个。"""
+    suffix = f"-{thread_id}.jsonl"
+    hits = []
+    for root, _, files in os.walk(os.path.join(codex_home, "sessions")):
+        hits += [os.path.join(root, f) for f in files if f.endswith(suffix)]
+    return hits
+
+
+def cmd_session_contexts(codex_home, thread_id, cached=""):
+    """定位并完整校验 session 文件，输出其中所有 turn_context。cached 为上次找到的路径，可避免重复遍历。"""
+    errors, path, contexts = [], cached, []
+    if not UUID_RE.match(thread_id or ""):
+        errors.append(f"线程 ID 格式不对：{thread_id}")
+    elif not path:
+        hits = find_session(codex_home, thread_id)
+        if len(hits) != 1:
+            errors.append(f"线程对应的 session 文件应恰好 1 个（实际 {len(hits)} 个）")
+        path = hits[0] if len(hits) == 1 else ""
+    if path and not errors:
+        st = os.lstat(path) if os.path.lexists(path) else None
+        if not st or not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            errors.append(f"session 文件不是普通文件（不存在、是符号链接或有多个硬链接）：{path}")
+        else:
+            with open(path, encoding="utf-8") as fh:
+                for i, line in enumerate(fh, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        errors.append(f"session 第 {i} 行不是合法 JSON")
+                        continue
+                    if i == 1 and (ev.get("type") != "session_meta" or (ev.get("payload") or {}).get("id") != thread_id):
+                        errors.append("session 第一行不是本线程的 session_meta")
+                    if ev.get("type") == "turn_context":
+                        p = ev.get("payload") or {}
+                        contexts.append({"cwd": p.get("cwd"), "sandbox": (p.get("sandbox_policy") or {}).get("type"),
+                                         "approval": p.get("approval_policy"),
+                                         "permission_profile": p.get("permission_profile")})
+    print(json.dumps({"ok": not errors, "errors": errors, "path": path, "contexts": contexts}, ensure_ascii=False))
+
+
+def cmd_state_commit(state, round_no, mode, status, exit_code, task_sha, thread_id="", session_path=""):
+    """本轮所有证据生成后最后写入 state：按轮次记录模式、状态、退出码和任务哈希，原子替换。"""
     with open(state, encoding="utf-8") as fh:
         data = json.load(fh)
-    if thread_id:
+    if thread_id and not data.get("thread_id"):
         data["thread_id"] = thread_id
+    if session_path:
+        data["session_path"] = session_path
     data["last_round"] = int(round_no)
+    data.setdefault("rounds", {})[str(round_no)] = {"mode": mode, "status": status,
+                                                   "exit_code": int(exit_code), "task_sha256": task_sha}
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state), prefix=".state.")
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(data, fh)
+        json.dump(data, fh, ensure_ascii=False)
     os.replace(tmp, state)
 
 
@@ -507,21 +712,13 @@ def cmd_mkdtemp(parent, prefix):
     print(tempfile.mkdtemp(prefix=prefix, dir=parent))
 
 
-def cmd_session(codex_home, thread_id):
-    """在 sessions 下查找文件名含线程 ID 的 JSONL；找不到时不输出。"""
-    for root, _, files in sorted(os.walk(os.path.join(codex_home, "sessions"))):
-        for f in sorted(files):
-            if thread_id in f and f.endswith(".jsonl"):
-                print(os.path.join(root, f))
-                return
-
-
 COMMANDS = {
-    "watched": cmd_watched, "gitadmin": cmd_gitadmin, "untracked": cmd_untracked, "remotes": cmd_remotes,
-    "config": cmd_config, "submodules": cmd_submodules, "watch-list": cmd_watch_list, "compare": cmd_compare,
-    "tools": cmd_tools, "digests": cmd_digests, "identity": cmd_identity, "regular": cmd_regular,
-    "write-report": cmd_write_report, "state-update": cmd_state_update, "mkdtemp": cmd_mkdtemp,
-    "session": cmd_session,
+    "watched": cmd_watched, "gitadmin": cmd_gitadmin, "untracked": cmd_untracked, "tracked": cmd_tracked,
+    "remotes": cmd_remotes, "config": cmd_config, "submodules": cmd_submodules, "check-filters": cmd_check_filters,
+    "watch-list": cmd_watch_list, "compare": cmd_compare, "tools": cmd_tools, "digests": cmd_digests,
+    "identity": cmd_identity, "regular": cmd_regular, "validate-events": cmd_validate_events,
+    "write-report": cmd_write_report, "session-contexts": cmd_session_contexts, "state-commit": cmd_state_commit,
+    "mkdtemp": cmd_mkdtemp,
 }
 
 if __name__ == "__main__":
