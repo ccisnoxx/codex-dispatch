@@ -1,91 +1,88 @@
 # codex-dispatch
 
-让 Claude Code 主会话指挥本机 Codex 完成开发任务的 Skill。
+一个薄的 Claude → Codex 调度层：Claude 理解需求、拆任务、决定方向并验收；Codex 消耗自己的上下文完成调查、局部设计、编码、命令执行和测试；调度器启动任务、保存线程并收集结果。
 
-Claude 负责全局决策、任务设计、上下文整理、风险判断和独立验收；Codex 在明确边界内自主调查、提出局部方案、编码、运行命令和测试，并返回可核查的执行证据。
-
-## 工作方式
-
-1. **Claude 准备派单。** 确认目标、工作区、允许修改的范围和验收条件，建立 Git 与监视文件的基线。
-2. **Codex 自主执行。** 通过 `codex exec` 执行任务；需要后续轮次时，续跑同一个 Codex 线程。
-3. **脚本收集证据。** 保留任务、事件、报告、退出码、文件哈希和仓库状态快照，检查 Git 元数据、监视文件与实际权限是否符合预期。
-4. **Claude 独立验收。** 阅读实际改动、核对范围并复跑关键检查。需要返工时，明确指出缺失的条件及其证据。
-
-完整任务模板、运行步骤和验收要求见 [SKILL.md](SKILL.md)。
-
-## 环境要求
-
-| 依赖 | 要求 |
-| --- | --- |
-| Claude Code | 能加载本地 Skill，并运行 Bash 命令与后台任务 |
-| Codex CLI | 当前脚本仅接受 `codex-cli 0.166.0`，需先完成自己的登录与配置 |
-| Shell | macOS、Linux 或 WSL 上的 Bash；WSL 尚未实测 |
-| Git | 2.31 及以上；目标仓库至少有一条提交；不支持已跟踪文件使用必需 filter 的仓库（如 Git LFS） |
-| Python | 3.11 及以上，用于通过 `tomllib` 解析 TOML |
-| 其他命令 | `jq`、`shasum` 和常用 Unix 命令 |
-
-脚本不安装依赖，也不传入沙箱、审批或网络配置参数。当前 `scripts/common.sh` 中的验收期望值为：
+## 安装与依赖
 
 ```bash
-EXPECTED_SANDBOX="danger-full-access"
-EXPECTED_APPROVAL="never"
-```
-
-这些值只供检查器比对，并不会设置或授予对应权限。使用前应核对自己的 Codex 配置和实际会话记录；其他权限组合尚未验证。升级 Codex 前，需要重新核对 CLI 参数、事件和 session 结构，运行回归测试，再更新 `SUPPORTED_CODEX_VERSIONS`。
-
-## 安装到 Claude Code
-
-如果 `~/.claude/skills/codex-dispatch` 尚不存在，可以直接克隆：
-
-```bash
-mkdir -p ~/.claude/skills
 git clone https://github.com/ccisnoxx/codex-dispatch.git ~/.claude/skills/codex-dispatch
 ```
 
-打开新的 Claude Code 会话，确认它能识别 `codex-dispatch`，然后给出任务，例如：
+需要 Python 3.9+（仅标准库）、Git，以及已登录并配置好的 Codex CLI。面向 macOS/Linux；使用 `fcntl`，不支持原生 Windows。当前接口在本机 Codex CLI 0.166.0 上核对，不硬编码版本白名单。升级后核对 `exec`/`exec resume` 的 `--json`、`--output-schema` 和事件格式。
 
-> 使用 codex-dispatch，让 Codex 先只读调查这个问题。由你整理上下文、限定范围和独立验收，确认方案后再安排实施。
+完整派单方法和七块 XML 模板见 [SKILL.md](SKILL.md)。打开能识别该 Skill 的 Claude Code 会话后，可以要求“让 Codex 调查并修复这个问题，由你设计任务和验收”。
 
-也可以直接使用 `/codex-dispatch` 并补充任务内容。Claude 应按 `SKILL.md` 完成工作区检查、建立基线和任务设计后再调用脚本。
+## 使用
 
-`SKILL.md` 中关于 `/codex:*` 插件禁用和警告抑制的描述来自原使用环境，不会通过安装本仓库自动修改你的 Claude 或 Codex 设置。使用本 Skill 的脚本不依赖该插件。
-
-## 脚本与证据
-
-| 文件 | 用途 |
-| --- | --- |
-| `scripts/new-run.sh` | 检查依赖和 Codex 版本，建立运行目录、manifest 与基线 |
-| `scripts/run.sh` | 校验 manifest、任务文件哈希、模式、线程 ID、仓库级锁及基线后执行任务；后续轮次续跑原线程 |
-| `scripts/check-run.sh` | 检查退出码、事件协议、session、线程 ID、实际权限、Git 状态、已跟踪文件与监视文件 |
-| `scripts/snapshot.sh` | 采集仓库及监视路径快照 |
-| `scripts/common.sh` | 支持版本、权限期望值、工具链清单及公共函数 |
-| `scripts/snaplib.py` | Python 辅助：递归哈希（跟随符号链接、防循环、扫描上限）、快照对比、监视清单、脱敏、写报告、工具链与运行目录身份 |
-| `tests/regression.sh` | 使用假 Codex 的隔离回归测试 |
-
-运行目录位于 `~/.cache/codex-dispatch/run.*`，保存每轮的任务、JSONL 事件、报告、退出码和快照。Claude 还需要把关键哈希保留在主会话中，作为独立核对的锚点。
-
-## 验证脚本
-
-在仓库根目录执行：
+任务文件使用 Markdown/XML，不要求额外任务 JSON schema。示例：
 
 ```bash
-bash tests/regression.sh
+python3 dispatch.py start /path/to/repo /path/to/task.md --mode readonly
+python3 dispatch.py start /path/to/repo /path/to/task.md --mode write
+python3 dispatch.py resume /path/to/run.dir /path/to/feedback.md
+python3 dispatch.py resume /path/to/run.dir /path/to/implementation.md --mode write
+python3 dispatch.py result /path/to/run.dir
 ```
 
-测试使用假 `codex` 和隔离的临时 HOME、Codex 配置及 Git 仓库，不调用真实模型。它覆盖 Git 元数据变化、监视文件变化、权限不符、证据篡改、输出路径和运行目录被符号链接重定向、目录符号链接与嵌套仓库、submodule 采集失败与工作树改动、空 include 文件、未登记命令被替换、只读与写入模式、事件协议与 session 校验、仓库级锁、凭证脱敏、扫描上限、工具链替换、版本检查和同线程续跑等场景。临时检查输出会保留，路径在测试末尾打印。
+`start` 在 `~/.cache/codex-dispatch/` 建立运行目录，输出其绝对路径及线程 ID。`resume` 从运行目录取明确线程，默认沿用上一轮模式；不会恢复“最近线程”。每轮保存：
 
-这份回归测试验证脚本的检查能力；真实任务是否满足需求，仍需 Claude 根据实际实现和测试证据验收。
+```text
+run.*/
+├── state.json
+├── .lock
+└── 1/
+    ├── task.md
+    ├── events.jsonl
+    ├── stderr.log
+    ├── report.txt
+    ├── result.json       # 结果符合 schema 时生成
+    ├── exit_code.txt
+    ├── before.json
+    ├── after.json
+    └── outcome.json
+```
 
-## 权限与审计边界
+完整日志留在文件中，默认只输出运行信息和 [结果 schema](schemas/result.schema.json) 规定的简短报告：
 
-此流程通过任务约定、状态对比和独立验收管理委派，**不提供操作系统或沙箱级访问控制**。`danger-full-access` 配置下，Codex 可能拥有当前系统用户的广泛访问权限，任务文本本身无法阻止越界操作。
+```json
+{
+  "status": "completed",
+  "summary": "修复了什么",
+  "changed_files": [],
+  "tests": [{"command": "pytest tests/test_retry.py", "status": "passed", "evidence": "3 passed"}],
+  "acceptance": [{"criterion": "非幂等请求不重试", "status": "met", "evidence": "回归测试通过"}],
+  "unverified": [],
+  "risks": []
+}
+```
 
-- 默认任务模板禁止 Codex 提交、推送、发布、部署、外部写入和修改 Git 元数据。
-- 被忽略文件的内容不在默认审计范围内，关键文件需要显式登记为额外监视路径。
-- 机械检查通过，不能证明未登记文件、凭证读取或外部系统没有受到影响。
-- 运行目录和 Codex session 可能包含源代码、路径、命令输出及凭证片段；公开分享前必须检查并脱敏。
-- 建议在隔离环境或不含敏感凭证的工作环境中使用。
+报告的 `status` 可为 `completed/partial/blocked`；测试为 `passed/failed/not_run`；验收项为 `met/unmet/unverified`。这些均为 Codex 自报。外层执行状态与报告状态分别保存，最终是否通过由 Claude 看任务、diff 和关键测试证据决定。
+
+## 两种模式与基本检查
+
+- `readonly`：任务要求不修改仓库，运行前后比较普通 Git status、tracked/staged diff、HEAD 和分支。可以在脏工作树调查。
+- `write`：首次写入要求干净工作树，包括未跟踪文件；已有改动可先放在合适的独立 worktree 中处理。续跑允许保留同一任务改动。Claude 负责选择任务分支，脚本不建分支、不提交、不推送。
+
+两种模式都不覆盖沙箱、审批或网络配置，使用本机默认值。任务提示禁止 commit、push、发布、修改仓库外文件和无关重构，允许自主完成低风险局部判断。
+
+每轮检查进程退出码、线程 ID、完成或错误事件和结构化结果，并记录基本 Git 状态。顶层 `completed` 仅指执行完成，不等于任务通过。退出码为 `0`（执行完成）、`1`（本轮执行或检查失败）、`2`（参数、文件、运行前检查或调度错误）。Codex 原始退出码另存。
+
+同一运行目录的并行调用会被轻量文件锁拒绝；同一工作树的不同任务由调用方保证只有一个写入者。强制终止留下的 `running` 状态不能盲目续跑，需先检查进程与改动。失败不回滚文件。
+
+## 边界
+
+本项目不提供访问隔离或取证保证，不扫描 Git 管理目录、工具链、配置或 Codex session，不建立哈希证据链。普通 Git 检查不覆盖被忽略文件、已有未跟踪文件内容的原地变化、特殊 Git 隐藏标记以及仓库外副作用。需要限制高权限执行时，应使用适合的隔离环境。
+
+运行记录默认保留，分享前检查源代码和敏感信息。确认不再续跑后可删除明确的运行目录；没有自动清理命令，不删除 Codex 全局会话或配置。旧审计实现可从 Git 提交 `d80f8df` 获取；旧运行目录不迁移到新接口。
+
+## 验证
+
+```bash
+python3 -B -m unittest discover -s tests -v
+```
+
+测试使用临时 HOME、Git 仓库和假 Codex，覆盖启动、明确线程续跑、模式切换、工作树约束、结果收集和失败报告，不调用真实模型。真实 Codex 的接口验证需要单独执行；Linux 与 Windows/WSL 的实际运行情况应以对应环境验证为准。
 
 ## 许可证
 
-本项目采用 [MIT License](LICENSE)。
+[MIT](LICENSE)。
