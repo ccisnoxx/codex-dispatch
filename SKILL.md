@@ -39,8 +39,8 @@ Claude 明确目标、范围和完成条件，把根因调查、代码定位、�
 </scope>
 
 <acceptance>
-1. ……
-2. ……
+AC-1: ……
+AC-2: ……
 </acceptance>
 
 <verification>
@@ -72,12 +72,14 @@ python3 /<skill>/dispatch.py start /<repo> /<task.md> --mode write
 python3 /<skill>/dispatch.py resume /<run_dir> /<feedback.md>
 python3 /<skill>/dispatch.py resume /<run_dir> /<implementation-task.md> --mode write
 python3 /<skill>/dispatch.py result /<run_dir>
+python3 /<skill>/dispatch.py result /<run_dir> --full
 ```
 
 - 长任务用 Bash 的 `run_in_background`，完成通知到达后再读取结果，不轮询完整日志。
 - `start` 新建运行目录并保存线程 ID；`resume` 使用该目录记录的明确线程，绝不使用 `--last`。模式默认沿用上一轮，可以显式切换。首次转为 `write` 也要求工作树干净。
-- 每轮任务、事件、stderr、最终报告、结构化结果、退出码及基本 Git 状态保存在 `~/.cache/codex-dispatch/run.*/<轮次>/`，默认输出只包含运行位置、线程、执行状态及结构化结果。
-- 顶层 `status=completed` 只说明进程正常结束、基本事件和结果可解析、Git 检查无异常。`result.status` 是 Codex 自报的 `completed/partial/blocked`，两者都不是 Claude 的验收结论。
+- 写入开始后，每次续跑前工作树（status、tracked/staged diff、未跟踪文件内容）必须与上一轮结束时一致，否则拒绝续跑。Claude 验收时不要在工作树留下改动或产物；需要接纳外部改动时，结束当前运行并重新 `start`。只读的多轮调查不受此限制。
+- 每轮任务、事件、stderr、最终报告、结构化结果、退出码及基本 Git 状态保存在 `~/.cache/codex-dispatch/run.*/<轮次>/`。默认输出运行位置、线程、`execution_status` 和截断后的结构化结果，`truncated` 标明是否截断；完整内容在 `result_file`，或用 `result --full` 查看。
+- `execution_status=completed` 只说明进程正常结束、基本事件和结果可解析、Git 检查无异常。`result.status` 是 Codex 自报的 `completed/partial/blocked`，两者都不是 Claude 的验收结论。
 - 退出码 `0` 为本轮执行完成；`1` 为进程、事件、结果或运行后 Git 检查失败；`2` 为参数、文件、运行前检查或调度错误。原始 Codex 退出码单独保存在结果中。
 - 失败先读摘要和必要日志，诊断后再续跑。没有线程 ID 时不能 resume。异常强制终止可能留下 `running` 状态；先确认进程已结束、检查已有改动，再建立新任务，不盲目重跑。
 
@@ -87,9 +89,9 @@ python3 /<skill>/dispatch.py result /<run_dir>
 
 逐项给出“通过／需要返工／未验证”。按影响选择最小独立检查，不机械重跑全部测试。结果中的测试和验收状态是 Codex 的报告，需要结合实际 diff 判断。
 
-返工使用同一线程，仅传未满足条件、对应证据和修正要求；模式或范围变化时重新写清范围与完成条件。同一验收最多两轮返工，仍未解决则报告证据、当前状态和剩余选项。超出原授权的高影响操作交回用户决定；不要自动回滚已有改动。
+返工使用同一线程，仅传未满足的验收编号、对应证据和修正要求；模式或范围变化时重新写清范围与完成条件。同一验收最多两轮返工，仍未解决则报告证据、当前状态和剩余选项。超出原授权的高影响操作交回用户决定；不要自动回滚已有改动。
 
-基本 Git 检查只覆盖普通 HEAD、分支、status 和 tracked/staged diff。它不审计 `.git`、配置、工具链、session、被忽略文件或仓库外副作用，也不检测已有未跟踪文件内容的原地变化。调度器不证明结果真实性。需要更强隔离时应另行选择执行环境。
+基本 Git 检查覆盖 HEAD、分支、status、tracked/staged diff 和未跟踪（未忽略）文件内容的哈希。它不审计 `.git`、配置、工具链、session、被忽略文件或仓库外副作用。调度器不证明结果真实性。需要更强隔离时应另行选择执行环境。
 
 运行记录默认保留，可能包含源代码和命令输出；分享前检查敏感信息。清理需确认不再续跑，只删除明确属于本任务的目录，不清理 Codex 全局会话或配置。
 

@@ -24,9 +24,9 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["criterion", "status", "evidence"],
+        "required": ["id", "status", "evidence"],
         "properties": {
-          "criterion": {"type": "string"},
+          "id": {"type": "string"},
           "status": {"type": "string", "enum": ["met", "unmet", "unverified"]},
           "evidence": {"type": "string"}
         }
