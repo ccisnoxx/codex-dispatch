@@ -71,12 +71,16 @@ python3 /<skill>/dispatch.py start /<repo> /<task.md> --mode readonly
 python3 /<skill>/dispatch.py start /<repo> /<task.md> --mode write
 python3 /<skill>/dispatch.py resume /<run_dir> /<feedback.md>
 python3 /<skill>/dispatch.py resume /<run_dir> /<implementation-task.md> --mode write
+python3 /<skill>/dispatch.py start /<repo> /<task.md> --mode write --model gpt-6.1-sol --effort xhigh
+python3 /<skill>/dispatch.py resume /<run_dir> /<feedback.md> --model gpt-6-astra --effort high
 python3 /<skill>/dispatch.py result /<run_dir>
 python3 /<skill>/dispatch.py result /<run_dir> --full
 ```
 
 - 长任务用 Bash 的 `run_in_background`，完成通知到达后再读取结果，不轮询完整日志。
 - `start` 新建运行目录并保存线程 ID；`resume` 使用该目录记录的明确线程，绝不使用 `--last`。模式默认沿用上一轮，可以显式切换。首次转为 `write` 也要求工作树干净。
+- `--model`、`--effort` 可选，分别传为 `--model` 和 `--config model_reasoning_effort=...`。不指定时跟随本机 Codex 配置；指定后成为该运行后续轮次的默认值，`resume` 可单独改其中一项。要回到本机默认需重新 `start`。调度器不维护模型白名单，不可用的组合由 Codex 报错。
+- 用户指定模型或 effort 时原样传入。未指定时新任务用本机默认，续跑沿用当前设置；普通任务不主动提升到 `xhigh`。复杂调试、跨模块推理或上一轮未解决时可以提高 effort 或换更强模型。切换模型不改变任务范围和授权。
 - 写入开始后，每次续跑前工作树（status、tracked/staged diff、未跟踪文件内容）必须与上一轮结束时一致，否则拒绝续跑。Claude 验收时不要在工作树留下改动或产物；需要接纳外部改动时，结束当前运行并重新 `start`。只读的多轮调查不受此限制。
 - 每轮任务、事件、stderr、最终报告、结构化结果、退出码及基本 Git 状态保存在 `~/.cache/codex-dispatch/run.*/<轮次>/`。默认输出运行位置、线程、`execution_status` 和截断后的结构化结果，`truncated` 标明是否截断；完整内容在 `result_file`，或用 `result --full` 查看。
 - `execution_status=completed` 只说明进程正常结束、基本事件和结果可解析、Git 检查无异常。`result.status` 是 Codex 自报的 `completed/partial/blocked`，两者都不是 Claude 的验收结论。

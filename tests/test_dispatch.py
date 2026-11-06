@@ -21,6 +21,7 @@ args = sys.argv[1:]
 assert args[0] == "exec"
 assert "--json" in args and "--output-schema" in args
 assert "--sandbox" not in args and "-s" not in args and "-c" not in args
+assert all(args[i + 1].startswith("model_reasoning_effort=") for i, arg in enumerate(args) if arg == "--config")
 assert args[-1] == "-"
 json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
 task = sys.stdin.read()
@@ -120,8 +121,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
         return json.loads(proc.stdout) if proc.stdout else proc.stderr
 
-    def start(self, mode="readonly", **kwargs):
-        return self.invoke("start", self.repo, self.task, "--mode", mode, **kwargs)
+    def start(self, *extra, mode="readonly", **kwargs):
+        return self.invoke("start", self.repo, self.task, "--mode", mode, *extra, **kwargs)
 
     def calls(self):
         return [json.loads(line) for line in (self.home / "calls.jsonl").read_text().splitlines()]
@@ -160,6 +161,43 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(second["thread_id"], first["thread_id"])
         self.assertEqual(self.calls()[1]["args"][1:3], ["resume", first["thread_id"]])
         self.assertEqual((self.repo / "a.txt").read_text(), "original\nchanged\nchanged\n")
+
+    def test_model_options_omitted_follow_codex_config(self):
+        result = self.start()
+        args = self.calls()[0]["args"]
+        self.assertNotIn("--model", args)
+        self.assertNotIn("--config", args)
+        self.assertIsNone(result["model_override"])
+        self.assertIsNone(result["effort_override"])
+
+    def test_start_passes_model_and_effort(self):
+        result = self.start("--model", "gpt-6.1-sol", "--effort", "xhigh")
+        args = self.calls()[0]["args"]
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
+        self.assertEqual(args[args.index("--config") + 1], 'model_reasoning_effort="xhigh"')
+        self.assertEqual(args[-1], "-")
+        self.assertEqual((result["model_override"], result["effort_override"]), ("gpt-6.1-sol", "xhigh"))
+
+    def test_resume_inherits_and_partially_overrides_model_options(self):
+        first = self.start("--model", "gpt-6.1-sol", "--effort", "xhigh")
+        second = self.invoke("resume", first["run_dir"], self.task)
+        third = self.invoke("resume", first["run_dir"], self.task, "--model", "gpt-6-astra")
+        fourth = self.invoke("resume", first["run_dir"], self.task, "--effort", "high")
+        self.assertEqual((second["model_override"], second["effort_override"]), ("gpt-6.1-sol", "xhigh"))
+        self.assertEqual((third["model_override"], third["effort_override"]), ("gpt-6-astra", "xhigh"))
+        self.assertEqual((fourth["model_override"], fourth["effort_override"]), ("gpt-6-astra", "high"))
+        args = self.calls()[3]["args"]
+        self.assertEqual(args[1:3], ["resume", first["thread_id"]])
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6-astra")
+        self.assertEqual(args[args.index("--config") + 1], 'model_reasoning_effort="high"')
+        outcome = json.loads((Path(first["run_dir"]) / "2" / "outcome.json").read_text())
+        self.assertEqual(outcome["model_override"], "gpt-6.1-sol")
+
+    def test_empty_model_option_rejected(self):
+        self.assertIn("不能为空", self.start("--model", " ", code=2))
+        first = self.start()
+        self.assertIn("不能为空", self.invoke("resume", first["run_dir"], self.task, "--effort", "", code=2))
+        self.assertEqual(len(self.calls()), 1)
 
     def test_resume_rejects_external_tracked_change_after_write(self):
         first = self.start(mode="write", behavior="edit")

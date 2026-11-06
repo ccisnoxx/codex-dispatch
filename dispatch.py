@@ -197,6 +197,7 @@ def output(run, state, full=False):
     value = {
         "run_dir": str(run), "thread_id": state["thread_id"],
         "round": state["round"], "mode": state["mode"], "execution_status": state["status"],
+        "model_override": state.get("model_override"), "effort_override": state.get("effort_override"),
         "exit_code": state.get("exit_code"), "errors": state.get("errors", []),
         "result_file": str(result_path) if result_path.exists() else None,
     }
@@ -211,7 +212,13 @@ def run_codex(state, round_dir, task, mode, schema, errors):
     cmd = ["codex", "exec"]
     if state["thread_id"]:
         cmd += ["resume", state["thread_id"]]
-    cmd += ["--json", "--output-schema", str(SCHEMA), "-"]
+    cmd += ["--json", "--output-schema", str(SCHEMA)]
+    if state.get("model_override"):
+        cmd += ["--model", state["model_override"]]
+    if state.get("effort_override"):
+        # 配置值按 TOML 解析，JSON 字符串字面量即合法的 TOML 字符串
+        cmd += ["--config", f"model_reasoning_effort={json.dumps(state['effort_override'])}"]
+    cmd.append("-")
     rc = None
     try:
         with (round_dir / "events.jsonl").open("w", encoding="utf-8") as events, \
@@ -300,6 +307,21 @@ def read_task(path):
     return task
 
 
+def override(value, previous, name):
+    """未指定时沿用本运行上一次的覆盖值；None 表示跟随 Codex 配置。模型与 effort 是否可用由 Codex 校验。"""
+    if value is None:
+        return previous
+    value = value.strip()
+    if not value:
+        raise DispatchError(f"{name} 不能为空")
+    return value
+
+
+def add_model_options(parser):
+    parser.add_argument("--model", help="覆盖 Codex 模型，并作为本运行后续轮次的默认值")
+    parser.add_argument("--effort", help="覆盖 model_reasoning_effort，并作为本运行后续轮次的默认值")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -307,10 +329,12 @@ def main():
     start.add_argument("repo")
     start.add_argument("task")
     start.add_argument("--mode", choices=("readonly", "write"), required=True)
+    add_model_options(start)
     resume = commands.add_parser("resume", help="使用明确线程续跑")
     resume.add_argument("run_dir")
     resume.add_argument("feedback")
     resume.add_argument("--mode", choices=("readonly", "write"))
+    add_model_options(resume)
     result = commands.add_parser("result", help="读取最近一轮结果，不启动 Codex")
     result.add_argument("run_dir")
     result.add_argument("--full", action="store_true", help="输出完整结果，不截断")
@@ -318,6 +342,8 @@ def main():
     try:
         if args.command == "start":
             task = read_task(args.task)
+            model = override(args.model, None, "--model")
+            effort = override(args.effort, None, "--effort")
             repo = Path(git(Path(args.repo).resolve(), "rev-parse", "--show-toplevel").strip()).resolve()
             initial = snapshot(repo)
             if args.mode == "write" and initial["status"]:
@@ -326,7 +352,8 @@ def main():
             run = Path(tempfile.mkdtemp(prefix="run.", dir=RUNS)).resolve()
             state = {"repo": str(repo), "thread_id": None, "round": 0,
                      "mode": args.mode, "status": "ready", "write_started": False,
-                     "head": initial["head"], "branch": initial["branch"]}
+                     "head": initial["head"], "branch": initial["branch"],
+                     "model_override": model, "effort_override": effort}
             save_json(run / "state.json", state)
         else:
             run = Path(args.run_dir).resolve()
@@ -348,6 +375,8 @@ def main():
                     raise DispatchError("上一轮未正常结束；先检查进程与已有改动，再建立新任务")
                 if not state["thread_id"]:
                     raise DispatchError("未取得线程 ID，无法续跑；请诊断后重新启动")
+                state["model_override"] = override(args.model, state.get("model_override"), "--model")
+                state["effort_override"] = override(args.effort, state.get("effort_override"), "--effort")
             return execute(run, state, task, args.mode or state["mode"])
     except (DispatchError, OSError, ValueError, KeyError) as exc:
         print(f"错误：{exc}", file=sys.stderr)

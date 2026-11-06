@@ -8,7 +8,7 @@
 git clone https://github.com/ccisnoxx/codex-dispatch.git ~/.claude/skills/codex-dispatch
 ```
 
-需要 Python 3.9+（仅标准库）、Git，以及已登录并配置好的 Codex CLI。面向 macOS/Linux；使用 `fcntl`，不支持原生 Windows。当前接口在本机 Codex CLI 0.166.0 上核对，不硬编码版本白名单。升级后核对 `exec`/`exec resume` 的 `--json`、`--output-schema` 和事件格式。
+需要 Python 3.9+（仅标准库）、Git，以及已登录并配置好的 Codex CLI。面向 macOS/Linux；使用 `fcntl`，不支持原生 Windows。当前接口在本机 Codex CLI 0.166.0 上核对，不硬编码版本白名单。升级后核对 `exec`/`exec resume` 的 `--json`、`--output-schema`、`--model`、`--config` 和事件格式。
 
 完整派单方法和七块 XML 模板见 [SKILL.md](SKILL.md)。打开能识别该 Skill 的 Claude Code 会话后，可以要求“让 Codex 调查并修复这个问题，由你设计任务和验收”。
 
@@ -21,9 +21,13 @@ python3 dispatch.py start /path/to/repo /path/to/task.md --mode readonly
 python3 dispatch.py start /path/to/repo /path/to/task.md --mode write
 python3 dispatch.py resume /path/to/run.dir /path/to/feedback.md
 python3 dispatch.py resume /path/to/run.dir /path/to/implementation.md --mode write
+python3 dispatch.py start /path/to/repo /path/to/task.md --mode write --model gpt-6.1-sol --effort xhigh
+python3 dispatch.py resume /path/to/run.dir /path/to/feedback.md --model gpt-6-astra --effort high
 python3 dispatch.py result /path/to/run.dir
 python3 dispatch.py result /path/to/run.dir --full
 ```
+
+`--model` 与 `--effort` 是可选覆盖，分别转为 Codex 的 `--model` 和 `--config model_reasoning_effort="..."`。不指定时不传任何覆盖，跟随本机 Codex 配置；指定后保存为该运行的 `model_override`/`effort_override`，后续 `resume` 默认沿用，也可只改其中一项。输出中的这两个字段是调度器请求的覆盖值，`null` 表示由 Codex 配置决定，不代表实际生效模型。模型和 effort 的可用性由 Codex 校验，失败按普通执行失败记录。
 
 `start` 在 `~/.cache/codex-dispatch/` 建立运行目录，输出其绝对路径及线程 ID。`resume` 从运行目录取明确线程，默认沿用上一轮模式；不会恢复“最近线程”。每轮保存：
 
@@ -84,7 +88,7 @@ run.*/
 python3 -B -m unittest discover -s tests -v
 ```
 
-测试使用临时 HOME、Git 仓库和假 Codex，覆盖启动、明确线程续跑、续跑前的工作树连续性、模式切换、工作树约束、事件顺序、输出截断、结果收集和失败报告，不调用真实模型。真实 Codex 的接口验证需要单独执行；Linux 与 Windows/WSL 的实际运行情况应以对应环境验证为准。
+测试使用临时 HOME、Git 仓库和假 Codex，覆盖启动、明确线程续跑、续跑前的工作树连续性、模式切换、模型与 effort 覆盖及继承、工作树约束、事件顺序、输出截断、结果收集和失败报告，不调用真实模型。真实 Codex 的接口验证需要单独执行；Linux 与 Windows/WSL 的实际运行情况应以对应环境验证为准。
 
 ## 许可证
 
