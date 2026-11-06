@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ args = sys.argv[1:]
 assert args[0] == "exec"
 assert "--json" in args and "--output-schema" in args
 assert "--sandbox" not in args and "-s" not in args and "-c" not in args
+assert all(args[i + 1].startswith("model_reasoning_effort=") for i, arg in enumerate(args) if arg == "--config")
 assert args[-1] == "-"
 json.loads(Path(args[args.index("--output-schema") + 1]).read_text())
 task = sys.stdin.read()
@@ -33,26 +35,46 @@ if behavior == "wrong_thread":
     tid = "other-thread"
 if behavior != "no_thread":
     print(json.dumps({"type": "thread.started", "thread_id": tid}))
+    if behavior == "duplicate_thread":
+        print(json.dumps({"type": "thread.started", "thread_id": tid}))
 print(json.dumps({"type": "turn.started"}))
+if behavior == "non_utf8":
+    sys.stdout.flush()
+    sys.stdout.buffer.write(b"\xff\xfe\n")
+    sys.stdout.buffer.flush()
 if behavior == "edit":
     with Path("a.txt").open("a") as stream:
         stream.write("changed\n")
+if behavior == "new_file":
+    Path("b.txt").write_text("created by codex\n")
 result = {
     "status": "blocked" if behavior == "blocked" else "completed",
     "summary": "已调查或实现",
     "changed_files": ["a.txt"] if behavior == "edit" else [],
     "tests": [{"command": "example", "status": "not_run", "evidence": "未执行"}],
-    "acceptance": [{"criterion": "目标", "status": "unverified", "evidence": "待验收"}],
+    "acceptance": [{"id": "AC-1", "status": "unverified", "evidence": "待验收"}],
     "unverified": ["真实业务测试"], "risks": []
 }
 if behavior == "bad_schema":
     result["tests"][0]["status"] = "maybe"
+if behavior == "long":
+    result["summary"] = "长" * 2000
+    result["tests"][0]["evidence"] = "日志" * 1000
+    result["changed_files"] = [f"f{i}.txt" for i in range(50)]
 text = "not JSON" if behavior == "bad_result" else json.dumps(result, ensure_ascii=False)
-print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}}))
-if behavior == "bad_event":
-    print("not an event")
-if behavior != "no_terminal":
-    print(json.dumps({"type": "turn.failed" if behavior == "turn_failed" else "turn.completed"}))
+message = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+terminal = json.dumps({"type": "turn.failed" if behavior == "turn_failed" else "turn.completed"})
+if behavior == "message_after_terminal":
+    print(terminal)
+    print(message)
+else:
+    print(message)
+    if behavior == "bad_event":
+        print("not an event")
+    if behavior != "no_terminal":
+        print(terminal)
+    if behavior == "duplicate_terminal":
+        print(terminal)
 print("详细诊断日志", file=sys.stderr)
 sys.exit(7 if behavior == "nonzero" else 0)
 '''
@@ -99,17 +121,19 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(proc.returncode, code, proc.stdout + proc.stderr)
         return json.loads(proc.stdout) if proc.stdout else proc.stderr
 
-    def start(self, mode="readonly", **kwargs):
-        return self.invoke("start", self.repo, self.task, "--mode", mode, **kwargs)
+    def start(self, *extra, mode="readonly", **kwargs):
+        return self.invoke("start", self.repo, self.task, "--mode", mode, *extra, **kwargs)
 
     def calls(self):
         return [json.loads(line) for line in (self.home / "calls.jsonl").read_text().splitlines()]
 
     def test_start_collects_logs_and_compact_result(self):
         result = self.start()
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution_status"], "completed")
         self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["truncated"])
         run = Path(result["run_dir"])
+        self.assertEqual(result["result_file"], str(run / "1" / "result.json"))
         self.assertEqual(self.calls()[0]["cwd"], str(self.repo.resolve()))
         for filename in ("task.md", "events.jsonl", "stderr.log", "report.txt", "result.json",
                          "exit_code.txt", "before.json", "after.json", "outcome.json"):
@@ -119,6 +143,17 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.invoke("result", run), result)
         self.assertEqual(len(self.calls()), 1)
 
+    def test_compact_output_limits_long_fields(self):
+        result = self.start(behavior="long")
+        self.assertTrue(result["truncated"])
+        self.assertLessEqual(len(result["result"]["summary"]), 601)
+        self.assertLessEqual(len(result["result"]["tests"][0]["evidence"]), 201)
+        self.assertEqual(len(result["result"]["changed_files"]), 20)
+        full = self.invoke("result", result["run_dir"], "--full")
+        self.assertEqual(len(full["result"]["summary"]), 2000)
+        self.assertEqual(len(full["result"]["changed_files"]), 50)
+        self.assertEqual(full["result"], json.loads(Path(result["result_file"]).read_text()))
+
     def test_resume_exact_thread_keeps_task_changes(self):
         first = self.start(mode="write", behavior="edit")
         second = self.invoke("resume", first["run_dir"], self.task, behavior="edit")
@@ -126,6 +161,63 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(second["thread_id"], first["thread_id"])
         self.assertEqual(self.calls()[1]["args"][1:3], ["resume", first["thread_id"]])
         self.assertEqual((self.repo / "a.txt").read_text(), "original\nchanged\nchanged\n")
+
+    def test_model_options_omitted_follow_codex_config(self):
+        result = self.start()
+        args = self.calls()[0]["args"]
+        self.assertNotIn("--model", args)
+        self.assertNotIn("--config", args)
+        self.assertIsNone(result["model_override"])
+        self.assertIsNone(result["effort_override"])
+
+    def test_start_passes_model_and_effort(self):
+        result = self.start("--model", "gpt-6.1-sol", "--effort", "xhigh")
+        args = self.calls()[0]["args"]
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6.1-sol")
+        self.assertEqual(args[args.index("--config") + 1], 'model_reasoning_effort="xhigh"')
+        self.assertEqual(args[-1], "-")
+        self.assertEqual((result["model_override"], result["effort_override"]), ("gpt-6.1-sol", "xhigh"))
+
+    def test_resume_inherits_and_partially_overrides_model_options(self):
+        first = self.start("--model", "gpt-6.1-sol", "--effort", "xhigh")
+        second = self.invoke("resume", first["run_dir"], self.task)
+        third = self.invoke("resume", first["run_dir"], self.task, "--model", "gpt-6-astra")
+        fourth = self.invoke("resume", first["run_dir"], self.task, "--effort", "high")
+        self.assertEqual((second["model_override"], second["effort_override"]), ("gpt-6.1-sol", "xhigh"))
+        self.assertEqual((third["model_override"], third["effort_override"]), ("gpt-6-astra", "xhigh"))
+        self.assertEqual((fourth["model_override"], fourth["effort_override"]), ("gpt-6-astra", "high"))
+        args = self.calls()[3]["args"]
+        self.assertEqual(args[1:3], ["resume", first["thread_id"]])
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6-astra")
+        self.assertEqual(args[args.index("--config") + 1], 'model_reasoning_effort="high"')
+        outcome = json.loads((Path(first["run_dir"]) / "2" / "outcome.json").read_text())
+        self.assertEqual(outcome["model_override"], "gpt-6.1-sol")
+
+    def test_empty_model_option_rejected(self):
+        self.assertIn("不能为空", self.start("--model", " ", code=2))
+        first = self.start()
+        self.assertIn("不能为空", self.invoke("resume", first["run_dir"], self.task, "--effort", "", code=2))
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_resume_rejects_external_tracked_change_after_write(self):
+        first = self.start(mode="write", behavior="edit")
+        with (self.repo / "a.txt").open("a") as stream:
+            stream.write("user\n")
+        error = self.invoke("resume", first["run_dir"], self.task, code=2)
+        self.assertIn("上一轮结束", error)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_resume_rejects_external_change_to_new_file_after_write(self):
+        first = self.start(mode="write", behavior="new_file")
+        (self.repo / "b.txt").write_text("edited by someone else\n")
+        error = self.invoke("resume", first["run_dir"], self.task, "--mode", "readonly", code=2)
+        self.assertIn("上一轮结束", error)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_readonly_rounds_allow_user_edits_between_rounds(self):
+        first = self.start()
+        (self.repo / "a.txt").write_text("user changes\n")
+        self.assertEqual(self.invoke("resume", first["run_dir"], self.task)["execution_status"], "completed")
 
     def test_dirty_write_rejected_without_starting_codex(self):
         for filename in ("a.txt", "untracked.txt"):
@@ -140,12 +232,14 @@ class DispatchTests(unittest.TestCase):
 
     def test_dirty_readonly_preserves_existing_changes(self):
         (self.repo / "a.txt").write_text("user changes\n")
-        self.assertEqual(self.start()["status"], "completed")
+        self.assertEqual(self.start()["execution_status"], "completed")
         self.assertEqual((self.repo / "a.txt").read_text(), "user changes\n")
 
     def test_readonly_detects_changes_without_rollback(self):
-        result = self.start(behavior="edit", code=1)
-        self.assertIn("readonly", " ".join(result["errors"]))
+        for behavior in ("edit", "new_file"):
+            with self.subTest(behavior=behavior):
+                result = self.start(behavior=behavior, code=1)
+                self.assertIn("readonly", " ".join(result["errors"]))
         self.assertIn("changed", (self.repo / "a.txt").read_text())
 
     def test_mode_transitions(self):
@@ -154,7 +248,7 @@ class DispatchTests(unittest.TestCase):
         third = self.invoke("resume", first["run_dir"], self.task, "--mode", "readonly")
         self.assertEqual(second["mode"], "write")
         self.assertEqual(third["mode"], "readonly")
-        self.assertEqual(third["status"], "completed")
+        self.assertEqual(third["execution_status"], "completed")
 
     def test_first_write_after_dirty_investigation_is_rejected(self):
         (self.repo / "a.txt").write_text("user changes\n")
@@ -165,27 +259,37 @@ class DispatchTests(unittest.TestCase):
 
     def test_execution_failures_remain_visible(self):
         for behavior in ("nonzero", "turn_failed", "bad_event", "bad_result", "bad_schema",
-                         "no_terminal", "no_thread"):
+                         "no_terminal", "no_thread", "duplicate_thread", "duplicate_terminal",
+                         "message_after_terminal"):
             with self.subTest(behavior=behavior):
                 result = self.start(behavior=behavior, code=1)
-                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["execution_status"], "failed")
                 self.assertTrue(result["errors"])
                 self.assertEqual(self.invoke("result", result["run_dir"]), result)
                 if behavior == "nonzero":
                     self.assertEqual(result["exit_code"], 7)
-                if behavior in ("bad_result", "bad_schema"):
+                if behavior in ("bad_result", "bad_schema", "message_after_terminal"):
                     self.assertIsNone(result["result"])
+
+    def test_unexpected_error_marks_round_failed(self):
+        result = self.start(behavior="non_utf8", code=1)
+        self.assertEqual(result["execution_status"], "failed")
+        self.assertIn("调度器内部错误", " ".join(result["errors"]))
+        run = Path(result["run_dir"])
+        self.assertEqual(json.loads((run / "state.json").read_text())["status"], "failed")
+        self.assertTrue((run / "1" / "after.json").is_file())
 
     def test_blocked_report_is_not_dispatch_failure_or_acceptance(self):
         result = self.start(behavior="blocked")
-        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution_status"], "completed")
         self.assertEqual(result["result"]["status"], "blocked")
-        self.assertEqual(result["result"]["acceptance"][0]["status"], "unverified")
+        self.assertEqual(result["result"]["acceptance"][0], {"id": "AC-1", "status": "unverified",
+                                                             "evidence": "待验收"})
 
     def test_resume_rejects_wrong_thread(self):
         first = self.start()
         result = self.invoke("resume", first["run_dir"], self.task, behavior="wrong_thread", code=1)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["execution_status"], "failed")
         self.assertEqual(result["thread_id"], first["thread_id"])
 
     def test_resume_rejects_changed_head(self):
@@ -198,12 +302,10 @@ class DispatchTests(unittest.TestCase):
     def test_missing_executable_records_failure(self):
         (self.bin / "codex").unlink()
         # PATH 仅保留 Git 所在目录，避免意外调用真实 Codex。
-        import shutil
-        git_path = shutil.which("git")
-        (self.bin / "git").symlink_to(git_path)
+        (self.bin / "git").symlink_to(shutil.which("git"))
         self.env["PATH"] = str(self.bin)
         result = self.start(code=1)
-        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["execution_status"], "failed")
         self.assertIn("无法执行 Codex", " ".join(result["errors"]))
 
     def test_empty_task_rejected(self):
